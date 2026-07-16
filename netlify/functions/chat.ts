@@ -15,15 +15,17 @@ type ChatRequestBody = {
 };
 
 const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
-const ANTHROPIC_MODEL = "claude-sonnet-5";
+// Primär- und Fallback-Modell: bei 529/overloaded wird auf das nächste Modell umgeschaltet,
+// damit der User nicht wegen kurzzeitiger Anthropic-Auslastung im Regen steht.
+const ANTHROPIC_MODELS = ["claude-sonnet-5", "claude-haiku-4-5"] as const;
 const ANTHROPIC_VERSION = "2023-06-01";
 const MAX_TOKENS = 1024;
 
 // Retry-Konfiguration für Anthropic-Aufrufe.
 // 529 = overloaded, 429 = rate-limited, 5xx = Server-Fehler bei Anthropic.
 const RETRY_STATUS = new Set([429, 500, 502, 503, 504, 529]);
-const MAX_ATTEMPTS = 4; // 1 Versuch + 3 Retries
-const BASE_DELAY_MS = 600; // exponentiell: 600, 1200, 2400 ms
+const MAX_ATTEMPTS_PER_MODEL = 2; // pro Modell 1 Versuch + 1 Retry
+const BASE_DELAY_MS = 500;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -42,13 +44,15 @@ type FetchOutcome =
   | { kind: "response"; response: Response; rawText: string }
   | { kind: "network-error"; error: unknown };
 
-async function callAnthropicWithRetry(
+async function callAnthropicModel(
   body: Record<string, unknown>,
   apiKey: string,
+  model: string,
 ): Promise<FetchOutcome> {
   let lastOutcome: FetchOutcome | null = null;
+  const payload = { ...body, model };
 
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS_PER_MODEL; attempt++) {
     try {
       const response = await fetch(ANTHROPIC_URL, {
         method: "POST",
@@ -57,7 +61,7 @@ async function callAnthropicWithRetry(
           "x-api-key": apiKey,
           "anthropic-version": ANTHROPIC_VERSION,
         },
-        body: JSON.stringify(body),
+        body: JSON.stringify(payload),
       });
       const rawText = await response.text();
 
@@ -67,10 +71,10 @@ async function callAnthropicWithRetry(
 
       lastOutcome = { kind: "response", response, rawText };
       console.warn(
-        `Anthropic ${response.status} (Versuch ${attempt}/${MAX_ATTEMPTS}) – wird wiederholt.`,
+        `Anthropic ${response.status} für Modell ${model} (Versuch ${attempt}/${MAX_ATTEMPTS_PER_MODEL}).`,
       );
 
-      if (attempt === MAX_ATTEMPTS) break;
+      if (attempt === MAX_ATTEMPTS_PER_MODEL) break;
       const retryAfter = parseRetryAfter(response.headers.get("retry-after"));
       const backoff = BASE_DELAY_MS * 2 ** (attempt - 1);
       const jitter = Math.floor(Math.random() * 250);
@@ -78,10 +82,10 @@ async function callAnthropicWithRetry(
     } catch (err) {
       lastOutcome = { kind: "network-error", error: err };
       console.warn(
-        `Anthropic-Netzwerkfehler (Versuch ${attempt}/${MAX_ATTEMPTS}):`,
+        `Anthropic-Netzwerkfehler für Modell ${model} (Versuch ${attempt}/${MAX_ATTEMPTS_PER_MODEL}):`,
         err,
       );
-      if (attempt === MAX_ATTEMPTS) break;
+      if (attempt === MAX_ATTEMPTS_PER_MODEL) break;
       const backoff = BASE_DELAY_MS * 2 ** (attempt - 1);
       const jitter = Math.floor(Math.random() * 250);
       await sleep(backoff + jitter);
@@ -89,6 +93,32 @@ async function callAnthropicWithRetry(
   }
 
   return lastOutcome ?? { kind: "network-error", error: new Error("Unknown") };
+}
+
+async function callAnthropicWithFallback(
+  body: Record<string, unknown>,
+  apiKey: string,
+): Promise<FetchOutcome> {
+  let lastOutcome: FetchOutcome = { kind: "network-error", error: new Error("no attempt") };
+
+  for (const model of ANTHROPIC_MODELS) {
+    const outcome = await callAnthropicModel(body, apiKey, model);
+    lastOutcome = outcome;
+
+    // Erfolg → sofort zurück.
+    if (outcome.kind === "response" && outcome.response.ok) return outcome;
+
+    // Bei 529/overloaded auf das nächste Modell fallen.
+    if (outcome.kind === "response" && outcome.response.status === 529) {
+      console.warn(`Modell ${model} überlastet – wechsle auf nächstes Modell.`);
+      continue;
+    }
+
+    // Bei anderen Fehlern (400, 401, 404 …) NICHT das Modell wechseln – Ursache liegt woanders.
+    return outcome;
+  }
+
+  return lastOutcome;
 }
 
 function jsonResponse(
@@ -140,7 +170,6 @@ export default async (req: Request, _context: Context): Promise<Response> => {
   }
 
   const anthropicBody: Record<string, unknown> = {
-    model: ANTHROPIC_MODEL,
     max_tokens: MAX_TOKENS,
     messages,
   };
@@ -151,7 +180,7 @@ export default async (req: Request, _context: Context): Promise<Response> => {
     anthropicBody.tools = tools;
   }
 
-  const outcome = await callAnthropicWithRetry(anthropicBody, apiKey);
+  const outcome = await callAnthropicWithFallback(anthropicBody, apiKey);
 
   if (outcome.kind === "network-error") {
     console.error("Anthropic-Request endgültig fehlgeschlagen:", outcome.error);
@@ -170,8 +199,12 @@ export default async (req: Request, _context: Context): Promise<Response> => {
       // rawText bleibt als Fallback
     }
     console.error("Anthropic-API antwortete mit Fehler:", upstream.status, upstreamError);
+    const clientMessage =
+      upstream.status === 529
+        ? "Anthropic ist gerade stark ausgelastet. Bitte in ein paar Minuten erneut versuchen."
+        : "Anthropic-API antwortete mit einem Fehler.";
     return jsonResponse(upstream.status, {
-      error: "Anthropic-API antwortete mit einem Fehler.",
+      error: clientMessage,
       status: upstream.status,
       details: upstreamError,
     });
