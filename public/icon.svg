@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200">
+  <rect x="0" y="0" width="200" height="200" rx="30" fill="#17171B"/>
+  <path d="M100 26 L176 164 L24 164 Z" fill="none" stroke="#C9A227" stroke-width="8" stroke-linejoin="round" stroke-linecap="round"/>
+  <text x="100" y="132" text-anchor="middle" font-family="'Space Grotesk','Poppins','Arial Black',sans-serif" font-weight="700" font-size="26" letter-spacing="-0.5"><tspan fill="#F1ECE1">My</tspan><tspan fill="#C9A227">Bro</tspan></text>
+</svg>

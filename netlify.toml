@@ -1,0 +1,31 @@
+[build]
+  command = "npm run build"
+  publish = "dist"
+  functions = "netlify/functions"
+
+[build.environment]
+  NODE_VERSION = "20"
+
+# TypeScript-Functions werden von esbuild gebündelt.
+[functions]
+  node_bundler = "esbuild"
+
+# Kurzer Alias für den Chat-Endpunkt.
+[[redirects]]
+  from = "/api/chat"
+  to = "/.netlify/functions/chat"
+  status = 200
+  force = true
+
+# SPA-Fallback: alle Client-Routen der React-App auf index.html leiten,
+# aber /api/* und /.netlify/* vorher davon ausnehmen (Reihenfolge zählt).
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+
+# Lokaler `netlify dev`-Standardport.
+[dev]
+  targetPort = 5173
+  port = 8888
+  framework = "vite"

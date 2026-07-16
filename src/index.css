@@ -1,0 +1,85 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg: #17171b;
+  --color-bg-elevated: #1f1f24;
+  --color-surface: #26262c;
+  --color-border: #2e2e35;
+  --color-text: #f1ece1;
+  --color-text-muted: #a8a297;
+  --color-accent: #c9a227;
+  --color-accent-hover: #d9b23a;
+
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+    Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-display: "Fraunces", ui-serif, Georgia, "Times New Roman", serif;
+}
+
+@layer base {
+  html {
+    height: 100%;
+    color-scheme: dark;
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+  }
+
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background-color: var(--color-bg);
+    color: var(--color-text);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    overflow-x: hidden;
+    overscroll-behavior-y: none;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    font-family: var(--font-display);
+    font-weight: 500;
+    letter-spacing: -0.01em;
+  }
+
+  /* Sichtbarer Fokus-Ring für Tastaturbedienung – hebt Klick-Fokus
+     bewusst nicht hervor (:focus-visible statt :focus). */
+  :focus {
+    outline: none;
+  }
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  /* iOS zoomt auf Input-Felder mit font-size < 16px. Basis-Wert
+     für alle mobilen Bildschirme sicherstellen. */
+  @media (max-width: 767px) {
+    input,
+    select,
+    textarea {
+      font-size: 16px;
+    }
+  }
+}
+
+@layer utilities {
+  /* Chat-Container: nutzt visualViewport-Höhe (per JS gesetzt), fällt
+     auf 100dvh zurück. Reserviert Layout-Padding + Header-Bereich. */
+  .h-chat-shell {
+    height: calc(var(--vvh, 100dvh) - 9rem);
+  }
+  @media (min-width: 768px) {
+    .h-chat-shell {
+      height: calc(100dvh - 6rem);
+    }
+  }
+}
