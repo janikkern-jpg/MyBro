@@ -121,6 +121,250 @@ async function callAnthropicWithFallback(
   return lastOutcome;
 }
 
+// ---------------------------------------------------------------------------
+// OpenAI-Fallback: springt nur an, wenn Anthropic dauerhaft mit 5xx/network
+// scheitert. Format wird transparent auf Anthropic-Shape zurückübersetzt,
+// damit das Frontend keinen Unterschied merkt.
+// ---------------------------------------------------------------------------
+
+const OPENAI_URL = "https://api.openai.com/v1/chat/completions";
+const OPENAI_MODEL = "gpt-5.4";
+
+type OpenAIToolCall = {
+  id?: string;
+  type?: string;
+  function?: { name?: string; arguments?: string };
+};
+
+type OpenAIResponse = {
+  id?: string;
+  model?: string;
+  choices?: Array<{
+    message?: {
+      role?: string;
+      content?: string | null;
+      tool_calls?: OpenAIToolCall[];
+    };
+    finish_reason?: string;
+  }>;
+};
+
+function toOpenAIMessages(
+  systemPrompt: string | undefined,
+  messages: AnthropicMessage[],
+): Array<Record<string, unknown>> {
+  const out: Array<Record<string, unknown>> = [];
+  if (systemPrompt && systemPrompt.length > 0) {
+    out.push({ role: "system", content: systemPrompt });
+  }
+
+  for (const msg of messages) {
+    const role = msg.role;
+    const content = msg.content;
+
+    // Kurzform: content ist ein String → 1:1 übernehmen.
+    if (typeof content === "string") {
+      out.push({ role, content });
+      continue;
+    }
+
+    if (!Array.isArray(content)) {
+      out.push({ role, content: JSON.stringify(content) });
+      continue;
+    }
+
+    if (role === "assistant") {
+      const textParts: string[] = [];
+      const toolCalls: Array<Record<string, unknown>> = [];
+
+      for (const block of content) {
+        if (!block || typeof block !== "object") continue;
+        const b = block as Record<string, unknown>;
+        if (b.type === "text" && typeof b.text === "string") {
+          textParts.push(b.text);
+        } else if (b.type === "tool_use") {
+          toolCalls.push({
+            id: String(b.id ?? ""),
+            type: "function",
+            function: {
+              name: String(b.name ?? ""),
+              arguments: JSON.stringify(b.input ?? {}),
+            },
+          });
+        }
+      }
+
+      const assistantMsg: Record<string, unknown> = {
+        role: "assistant",
+        content: textParts.join("") || null,
+      };
+      if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
+      out.push(assistantMsg);
+    } else {
+      // role === "user": tool_result-Blöcke müssen zu eigenen role="tool"-Messages werden,
+      // Textblöcke bleiben eine user-Message.
+      const textParts: string[] = [];
+      const toolResultMsgs: Array<Record<string, unknown>> = [];
+
+      for (const block of content) {
+        if (!block || typeof block !== "object") continue;
+        const b = block as Record<string, unknown>;
+        if (b.type === "text" && typeof b.text === "string") {
+          textParts.push(b.text);
+        } else if (b.type === "tool_result") {
+          const c = b.content;
+          const contentStr = typeof c === "string" ? c : JSON.stringify(c);
+          toolResultMsgs.push({
+            role: "tool",
+            tool_call_id: String(b.tool_use_id ?? ""),
+            content: contentStr,
+          });
+        }
+      }
+
+      for (const trm of toolResultMsgs) out.push(trm);
+      if (textParts.length > 0) {
+        out.push({ role: "user", content: textParts.join("") });
+      }
+    }
+  }
+
+  return out;
+}
+
+function toOpenAITools(tools: unknown[] | undefined): unknown[] | undefined {
+  if (!Array.isArray(tools) || tools.length === 0) return undefined;
+  const converted: unknown[] = [];
+  for (const t of tools) {
+    if (!t || typeof t !== "object") continue;
+    const tt = t as Record<string, unknown>;
+    const name = typeof tt.name === "string" ? tt.name : undefined;
+    if (!name) continue;
+    converted.push({
+      type: "function",
+      function: {
+        name,
+        description: typeof tt.description === "string" ? tt.description : "",
+        parameters: tt.input_schema ?? { type: "object", properties: {} },
+      },
+    });
+  }
+  return converted.length > 0 ? converted : undefined;
+}
+
+function mapOpenAIFinishReasonToAnthropic(reason: string | undefined): string {
+  switch (reason) {
+    case "stop":
+      return "end_turn";
+    case "tool_calls":
+      return "tool_use";
+    case "length":
+      return "max_tokens";
+    case "content_filter":
+      return "stop_sequence";
+    default:
+      return "end_turn";
+  }
+}
+
+function openAIToAnthropicResponse(resp: OpenAIResponse): Record<string, unknown> {
+  const choice = resp.choices?.[0];
+  const message = choice?.message;
+  const content: Array<Record<string, unknown>> = [];
+
+  if (message && typeof message.content === "string" && message.content.length > 0) {
+    content.push({ type: "text", text: message.content });
+  }
+
+  if (message?.tool_calls && Array.isArray(message.tool_calls)) {
+    for (const tc of message.tool_calls) {
+      if (!tc || tc.type !== "function" || !tc.function) continue;
+      let input: unknown = {};
+      const rawArgs = tc.function.arguments;
+      if (typeof rawArgs === "string" && rawArgs.length > 0) {
+        try {
+          input = JSON.parse(rawArgs);
+        } catch {
+          input = { _raw: rawArgs };
+        }
+      }
+      content.push({
+        type: "tool_use",
+        id: tc.id ?? `call_${Math.random().toString(36).slice(2, 10)}`,
+        name: tc.function.name ?? "",
+        input,
+      });
+    }
+  }
+
+  if (content.length === 0) {
+    content.push({ type: "text", text: "" });
+  }
+
+  return {
+    id: resp.id ?? `msg_openai_${Date.now()}`,
+    type: "message",
+    role: "assistant",
+    model: resp.model ?? OPENAI_MODEL,
+    stop_reason: mapOpenAIFinishReasonToAnthropic(choice?.finish_reason),
+    stop_sequence: null,
+    content,
+    usage: { input_tokens: 0, output_tokens: 0 },
+  };
+}
+
+type OpenAIOutcome =
+  | { kind: "success"; anthropicShaped: Record<string, unknown> }
+  | { kind: "error"; status: number; details: unknown }
+  | { kind: "network-error"; error: unknown };
+
+async function callOpenAI(
+  systemPrompt: string | undefined,
+  messages: AnthropicMessage[],
+  tools: unknown[] | undefined,
+  apiKey: string,
+): Promise<OpenAIOutcome> {
+  const openAIBody: Record<string, unknown> = {
+    model: OPENAI_MODEL,
+    messages: toOpenAIMessages(systemPrompt, messages),
+    max_completion_tokens: MAX_TOKENS,
+  };
+  const openAITools = toOpenAITools(tools);
+  if (openAITools) openAIBody.tools = openAITools;
+
+  let response: Response;
+  try {
+    response = await fetch(OPENAI_URL, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(openAIBody),
+    });
+  } catch (err) {
+    return { kind: "network-error", error: err };
+  }
+
+  const rawText = await response.text();
+  if (!response.ok) {
+    let details: unknown = rawText;
+    try {
+      details = JSON.parse(rawText);
+    } catch {
+      // rawText bleibt Fallback
+    }
+    return { kind: "error", status: response.status, details };
+  }
+
+  try {
+    const parsed = JSON.parse(rawText) as OpenAIResponse;
+    return { kind: "success", anthropicShaped: openAIToAnthropicResponse(parsed) };
+  } catch {
+    return { kind: "error", status: 502, details: "invalid_json_from_openai" };
+  }
+}
+
 function jsonResponse(
   status: number,
   body: unknown,
@@ -182,6 +426,73 @@ export default async (req: Request, _context: Context): Promise<Response> => {
 
   const outcome = await callAnthropicWithFallback(anthropicBody, apiKey);
 
+  // ------------------------------------------------------------------------
+  // Anthropic hat geantwortet und war OK → direkt zurückgeben.
+  // ------------------------------------------------------------------------
+  if (outcome.kind === "response" && outcome.response.ok) {
+    try {
+      const parsed = JSON.parse(outcome.rawText);
+      console.log("[provider=claude] Antwort erfolgreich.");
+      return jsonResponse(200, parsed);
+    } catch {
+      console.error("Anthropic-Response konnte nicht als JSON geparst werden.");
+      // Fällt unten in den OpenAI-Fallback.
+    }
+  }
+
+  // ------------------------------------------------------------------------
+  // Anthropic hat "unrettbar" gescheitert (Netzwerkfehler ODER 5xx). Wenn ein
+  // OPENAI_API_KEY konfiguriert ist, versuchen wir OpenAI als Fallback.
+  // Bei 4xx-Fehlern (400/401/404 …) NICHT umschalten – da liegt ein Bug oder
+  // Auth-Problem vor, das auch OpenAI nicht löst.
+  // ------------------------------------------------------------------------
+  const anthropicStatus =
+    outcome.kind === "response" ? outcome.response.status : 0;
+  const anthropicUnrecoverable =
+    outcome.kind === "network-error" ||
+    (outcome.kind === "response" && anthropicStatus >= 500);
+
+  if (anthropicUnrecoverable) {
+    const openAIKey = process.env.OPENAI_API_KEY;
+    if (openAIKey) {
+      console.warn(
+        `Anthropic endgültig fehlgeschlagen (${
+          outcome.kind === "network-error" ? "network" : anthropicStatus
+        }) – aktiviere OpenAI-Fallback.`,
+      );
+      const openAIOutcome = await callOpenAI(
+        systemPrompt,
+        messages,
+        tools,
+        openAIKey,
+      );
+
+      if (openAIOutcome.kind === "success") {
+        console.log("[provider=openai-fallback] Antwort erfolgreich.");
+        return jsonResponse(200, openAIOutcome.anthropicShaped);
+      }
+
+      if (openAIOutcome.kind === "error") {
+        console.error(
+          "OpenAI-Fallback fehlgeschlagen:",
+          openAIOutcome.status,
+          openAIOutcome.details,
+        );
+      } else {
+        console.error("OpenAI-Fallback-Netzwerkfehler:", openAIOutcome.error);
+      }
+      // Falls OpenAI ebenfalls scheitert: unten die ursprüngliche
+      // Anthropic-Fehlermeldung an das Frontend geben.
+    } else {
+      console.warn(
+        "OPENAI_API_KEY nicht gesetzt – kein Cross-Provider-Fallback möglich.",
+      );
+    }
+  }
+
+  // ------------------------------------------------------------------------
+  // Ab hier: Anthropic-Fehler an das Frontend weiterreichen (Original-Verhalten).
+  // ------------------------------------------------------------------------
   if (outcome.kind === "network-error") {
     console.error("Anthropic-Request endgültig fehlgeschlagen:", outcome.error);
     return errorResponse(502, "Anthropic-API nicht erreichbar.");
@@ -191,14 +502,17 @@ export default async (req: Request, _context: Context): Promise<Response> => {
   const rawText = outcome.rawText;
 
   if (!upstream.ok) {
-    // Anthropic-Antwort weitergeben, aber Struktur säubern (kein Stacktrace, keine Header-Leaks).
     let upstreamError: unknown = rawText;
     try {
       upstreamError = JSON.parse(rawText);
     } catch {
-      // rawText bleibt als Fallback
+      // rawText bleibt Fallback
     }
-    console.error("Anthropic-API antwortete mit Fehler:", upstream.status, upstreamError);
+    console.error(
+      "Anthropic-API antwortete mit Fehler:",
+      upstream.status,
+      upstreamError,
+    );
     const clientMessage =
       upstream.status === 529
         ? "Anthropic ist gerade stark ausgelastet. Bitte in ein paar Minuten erneut versuchen."
@@ -210,13 +524,9 @@ export default async (req: Request, _context: Context): Promise<Response> => {
     });
   }
 
-  try {
-    const parsed = JSON.parse(rawText);
-    return jsonResponse(200, parsed);
-  } catch {
-    console.error("Anthropic-Response konnte nicht als JSON geparst werden.");
-    return errorResponse(502, "Ungültige Antwort von der Anthropic-API.");
-  }
+  // Sollte nach oben nicht mehr erreicht werden – Safety-Fallback.
+  console.error("Anthropic-Response konnte nicht als JSON geparst werden.");
+  return errorResponse(502, "Ungültige Antwort von der Anthropic-API.");
 };
 
 // Optional: Netlify-Config für den Endpunkt-Pfad.
