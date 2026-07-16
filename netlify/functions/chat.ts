@@ -19,7 +19,8 @@ const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
 // damit der User nicht wegen kurzzeitiger Anthropic-Auslastung im Regen steht.
 const ANTHROPIC_MODELS = ["claude-sonnet-5", "claude-haiku-4-5"] as const;
 const ANTHROPIC_VERSION = "2023-06-01";
-const MAX_TOKENS = 1024;
+// Ausreichend Spielraum für lange Coach-Antworten – 1024 hatte oft mitten im Satz gestoppt.
+const MAX_TOKENS = 4096;
 
 // Retry-Konfiguration für Anthropic-Aufrufe.
 // 529 = overloaded, 429 = rate-limited, 5xx = Server-Fehler bei Anthropic.
