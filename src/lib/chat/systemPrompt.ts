@@ -95,6 +95,8 @@ function guidanceBlock(): string {
   return [
     "FÜHRUNG:",
     "- Antworte immer auf Deutsch, warm, konkret, ohne Floskeln.",
+    "- Halte Antworten möglichst unter 200 Wörtern. Nur wenn der Nutzer ausdrücklich",
+    "  um mehr Tiefe, Ausführlichkeit oder eine längere Erklärung bittet, geh in die Länge.",
     "- Führe EIN durchgehendes Gespräch, keine Serie von Einzelchats.",
     "  Nimm frühere Themen und den Verlauf natürlich auf.",
     "- Wenn ein Thema erkennbar abgeschlossen ist und der Verlauf lang geworden ist,",
