@@ -19,6 +19,78 @@ const ANTHROPIC_MODEL = "claude-sonnet-5";
 const ANTHROPIC_VERSION = "2023-06-01";
 const MAX_TOKENS = 1024;
 
+// Retry-Konfiguration für Anthropic-Aufrufe.
+// 529 = overloaded, 429 = rate-limited, 5xx = Server-Fehler bei Anthropic.
+const RETRY_STATUS = new Set([429, 500, 502, 503, 504, 529]);
+const MAX_ATTEMPTS = 4; // 1 Versuch + 3 Retries
+const BASE_DELAY_MS = 600; // exponentiell: 600, 1200, 2400 ms
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function parseRetryAfter(header: string | null): number | null {
+  if (!header) return null;
+  const seconds = Number(header);
+  if (!Number.isNaN(seconds) && seconds >= 0) return seconds * 1000;
+  const dateMs = Date.parse(header);
+  if (!Number.isNaN(dateMs)) return Math.max(0, dateMs - Date.now());
+  return null;
+}
+
+type FetchOutcome =
+  | { kind: "response"; response: Response; rawText: string }
+  | { kind: "network-error"; error: unknown };
+
+async function callAnthropicWithRetry(
+  body: Record<string, unknown>,
+  apiKey: string,
+): Promise<FetchOutcome> {
+  let lastOutcome: FetchOutcome | null = null;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const response = await fetch(ANTHROPIC_URL, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": apiKey,
+          "anthropic-version": ANTHROPIC_VERSION,
+        },
+        body: JSON.stringify(body),
+      });
+      const rawText = await response.text();
+
+      if (response.ok || !RETRY_STATUS.has(response.status)) {
+        return { kind: "response", response, rawText };
+      }
+
+      lastOutcome = { kind: "response", response, rawText };
+      console.warn(
+        `Anthropic ${response.status} (Versuch ${attempt}/${MAX_ATTEMPTS}) – wird wiederholt.`,
+      );
+
+      if (attempt === MAX_ATTEMPTS) break;
+      const retryAfter = parseRetryAfter(response.headers.get("retry-after"));
+      const backoff = BASE_DELAY_MS * 2 ** (attempt - 1);
+      const jitter = Math.floor(Math.random() * 250);
+      await sleep(retryAfter ?? backoff + jitter);
+    } catch (err) {
+      lastOutcome = { kind: "network-error", error: err };
+      console.warn(
+        `Anthropic-Netzwerkfehler (Versuch ${attempt}/${MAX_ATTEMPTS}):`,
+        err,
+      );
+      if (attempt === MAX_ATTEMPTS) break;
+      const backoff = BASE_DELAY_MS * 2 ** (attempt - 1);
+      const jitter = Math.floor(Math.random() * 250);
+      await sleep(backoff + jitter);
+    }
+  }
+
+  return lastOutcome ?? { kind: "network-error", error: new Error("Unknown") };
+}
+
 function jsonResponse(
   status: number,
   body: unknown,
@@ -79,23 +151,15 @@ export default async (req: Request, _context: Context): Promise<Response> => {
     anthropicBody.tools = tools;
   }
 
-  let upstream: Response;
-  try {
-    upstream = await fetch(ANTHROPIC_URL, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": ANTHROPIC_VERSION,
-      },
-      body: JSON.stringify(anthropicBody),
-    });
-  } catch (err) {
-    console.error("Anthropic-Request fehlgeschlagen:", err);
+  const outcome = await callAnthropicWithRetry(anthropicBody, apiKey);
+
+  if (outcome.kind === "network-error") {
+    console.error("Anthropic-Request endgültig fehlgeschlagen:", outcome.error);
     return errorResponse(502, "Anthropic-API nicht erreichbar.");
   }
 
-  const rawText = await upstream.text();
+  const upstream = outcome.response;
+  const rawText = outcome.rawText;
 
   if (!upstream.ok) {
     // Anthropic-Antwort weitergeben, aber Struktur säubern (kein Stacktrace, keine Header-Leaks).
