@@ -1,14 +1,15 @@
-import type { Context } from "@netlify/functions";
 import {
   callAnthropicWithFallback,
   isAnthropicUnrecoverable,
   type AnthropicMessage,
-} from "./_shared/anthropic";
-import { callOpenAIText } from "./_shared/openaiText";
-import { selectModelForMessages } from "./_shared/modelRouting";
-import { usageFromAnthropicJson, type UsageRecord } from "./_shared/pricing";
+} from "../_shared/anthropic";
+import { callOpenAIText } from "../_shared/openaiText";
+import { selectModelForMessages } from "../_shared/modelRouting";
+import { usageFromAnthropicJson, type UsageRecord } from "../_shared/pricing";
+import type { PagesHandler } from "../_shared/pages";
 
-// MyBro-Chat-Endpoint. Proxy für Anthropic mit
+// MyBro-Chat-Endpoint (Cloudflare Pages Functions).
+// Proxy für Anthropic mit
 // - gemeinsamem Modell-Routing (haiku/sonnet/opus je nach Komplexität,
 //   siehe _shared/modelRouting.ts) – identisch zur Smalltalk-Route,
 // - Overload-Fallback (nächst-günstigeres Modell bei 529) und
@@ -20,20 +21,14 @@ type ChatRequestBody = {
   tools?: unknown[];
 };
 
-// Ausreichend Spielraum für lange Coach-Antworten – 1024 hatte oft mitten im Satz gestoppt.
 const MAX_TOKENS = 4096;
 
-function jsonResponse(
-  status: number,
-  body: unknown,
-  extraHeaders: Record<string, string> = {},
-): Response {
+function jsonResponse(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: {
       "content-type": "application/json; charset=utf-8",
       "cache-control": "no-store",
-      ...extraHeaders,
     },
   });
 }
@@ -42,12 +37,8 @@ function errorResponse(status: number, message: string): Response {
   return jsonResponse(status, { error: message });
 }
 
-export default async (req: Request, _context: Context): Promise<Response> => {
-  if (req.method !== "POST") {
-    return errorResponse(405, "Nur POST erlaubt.");
-  }
-
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+export const onRequestPost: PagesHandler = async ({ request, env }) => {
+  const apiKey = env.ANTHROPIC_API_KEY;
   if (!apiKey) {
     return errorResponse(
       500,
@@ -57,7 +48,7 @@ export default async (req: Request, _context: Context): Promise<Response> => {
 
   let payload: ChatRequestBody;
   try {
-    payload = (await req.json()) as ChatRequestBody;
+    payload = (await request.json()) as ChatRequestBody;
   } catch {
     return errorResponse(400, "Ungültiges JSON im Request-Body.");
   }
@@ -82,10 +73,6 @@ export default async (req: Request, _context: Context): Promise<Response> => {
     anthropicBody.tools = tools;
   }
 
-  // Gemeinsames Modell-Routing: klassifiziert den letzten menschlichen
-  // User-Text und liefert die passende Modellkette (primär + Overload-
-  // Fallbacks). Bei Klassifikator-Fehler → sicherer Default "mittel"
-  // (sonnet-5).
   const selection = await selectModelForMessages(messages, apiKey);
   console.log(
     `[mybro] complexity=${selection.complexity}` +
@@ -93,10 +80,6 @@ export default async (req: Request, _context: Context): Promise<Response> => {
       ` → models=${selection.models.join("→")}`,
   );
 
-  // Alle in diesem Request angefallenen API-Aufrufe (Klassifikator +
-  // Haupt-Call [+ ggf. OpenAI-Fallback]) werden hier gesammelt und am
-  // Ende dem Client als `_usage` mitgegeben; dieser schreibt sie in
-  // die `usage_log`-Tabelle.
   const usageBucket: UsageRecord[] = [];
   if (selection.classifierUsage) usageBucket.push(selection.classifierUsage);
 
@@ -115,13 +98,11 @@ export default async (req: Request, _context: Context): Promise<Response> => {
       return jsonResponse(200, { ...parsed, _usage: usageBucket });
     } catch {
       console.error("Anthropic-Response konnte nicht als JSON geparst werden.");
-      // Fällt unten in den OpenAI-Fallback.
     }
   }
 
-  // Cross-Provider-Fallback: nur bei 5xx / Netzwerkfehler.
   if (isAnthropicUnrecoverable(outcome)) {
-    const openAIKey = process.env.OPENAI_API_KEY;
+    const openAIKey = env.OPENAI_API_KEY;
     if (openAIKey) {
       const anthropicStatus =
         outcome.kind === "response" ? outcome.response.status : "network";
@@ -193,8 +174,4 @@ export default async (req: Request, _context: Context): Promise<Response> => {
 
   console.error("Anthropic-Response konnte nicht als JSON geparst werden.");
   return errorResponse(502, "Ungültige Antwort von der Anthropic-API.");
-};
-
-export const config = {
-  path: ["/api/chat", "/.netlify/functions/chat"],
 };

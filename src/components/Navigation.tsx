@@ -1,18 +1,37 @@
 import { NavLink } from "react-router-dom";
 import type { ComponentType, SVGProps } from "react";
-import { CalendarIcon, ChatIcon, PlanIcon } from "./icons";
+import {
+  CalendarIcon,
+  ChatIcon,
+  ClockIcon,
+  FolderIcon,
+  PlanIcon,
+} from "./icons";
 import logoUrl from "../assets/logo.svg";
+import { useMode } from "../lib/mode";
 
 type NavItem = {
   to: string;
   label: string;
+  shortLabel?: string;
   Icon: ComponentType<SVGProps<SVGSVGElement>>;
 };
 
-const items: NavItem[] = [
+const mybroItems: NavItem[] = [
   { to: "/chat", label: "Chat", Icon: ChatIcon },
   { to: "/kalender", label: "Kalender", Icon: CalendarIcon },
   { to: "/plan", label: "Plan", Icon: PlanIcon },
+];
+
+const smalltalkItems: NavItem[] = [
+  { to: "/chat", label: "Chat", Icon: ChatIcon },
+  {
+    to: "/smalltalk/zuletzt",
+    label: "Zuletzt verwendet",
+    shortLabel: "Zuletzt",
+    Icon: ClockIcon,
+  },
+  { to: "/smalltalk/projekte", label: "Projekte", Icon: FolderIcon },
 ];
 
 type Props = {
@@ -20,6 +39,9 @@ type Props = {
 };
 
 export default function Navigation({ variant }: Props) {
+  const { mode } = useMode();
+  const items = mode === "smalltalk" ? smalltalkItems : mybroItems;
+
   if (variant === "sidebar") {
     return (
       <aside className="hidden md:flex md:sticky md:top-0 md:h-dvh md:w-64 md:flex-col md:border-r md:border-border md:bg-bg-elevated">
@@ -55,11 +77,11 @@ export default function Navigation({ variant }: Props) {
 
   return (
     <nav
-      className="fixed inset-x-0 bottom-0 z-50 border-t border-border bg-bg-elevated/95 pb-[env(safe-area-inset-bottom)] backdrop-blur md:hidden"
+      className="mobile-bottom-nav fixed inset-x-0 bottom-0 z-50 border-t border-border bg-bg-elevated/95 pb-[env(safe-area-inset-bottom)] backdrop-blur md:hidden"
       aria-label="Hauptnavigation"
     >
       <ul className="mx-auto flex max-w-lg items-stretch justify-around">
-        {items.map(({ to, label, Icon }) => (
+        {items.map(({ to, label, shortLabel, Icon }) => (
           <li key={to} className="flex-1">
             <NavLink
               to={to}
@@ -71,7 +93,7 @@ export default function Navigation({ variant }: Props) {
               }
             >
               <Icon className="h-6 w-6" aria-hidden="true" />
-              <span>{label}</span>
+              <span>{shortLabel ?? label}</span>
             </NavLink>
           </li>
         ))}

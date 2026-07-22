@@ -72,13 +72,47 @@
 }
 
 @layer utilities {
-  /* Chat-Container: nutzt visualViewport-Höhe (per JS gesetzt), fällt
-     auf 100dvh zurück. Reserviert Layout-Padding + Header-Bereich. */
+  /* Chat-Container.
+     Mobil: fest an den sichtbaren Viewport (`visualViewport`) verankert,
+     damit iOS/Android die Seite nicht hochschieben, sobald die
+     Bildschirmtastatur erscheint. `--vvh` und `--vvo` werden im Layout
+     per JS aus `window.visualViewport` gepflegt; `--chat-top` = Höhe
+     des mobilen Headers (Notch-tauglich per ResizeObserver gemessen);
+     `--chat-bottom` = Platz für die Bottom-Nav (0, sobald die Tastatur
+     offen ist, siehe unten). Nur der innere Nachrichtenbereich scrollt,
+     Header/Modus-Schalter/Composer bleiben fix positioniert. */
   .h-chat-shell {
-    height: calc(var(--vvh, 100dvh) - 9rem);
+    position: fixed;
+    left: 0;
+    right: 0;
+    top: calc(var(--vvo, 0px) + var(--chat-top, 3.5rem));
+    height: calc(
+      var(--vvh, 100dvh)
+      - var(--chat-top, 3.5rem)
+      - var(--chat-bottom, calc(5rem + env(safe-area-inset-bottom)))
+    );
+    padding: 0.75rem 1.25rem 0.75rem 1.25rem;
+    z-index: 10;
+    /* Verhindert, dass innerhalb des Chats gestartete Scroll-Bewegungen
+       die (nicht scrollende) Seite dahinter mitziehen. */
+    overscroll-behavior: contain;
+  }
+  /* Wenn die virtuelle Tastatur offen ist, verschwindet die Bottom-Nav
+     ohnehin visuell hinter der Tastatur – wir dürfen den Platz dafür
+     dann nicht doppelt vom Chat abziehen. */
+  html[data-keyboard-open="true"] .h-chat-shell {
+    --chat-bottom: 0px;
+  }
+  html[data-keyboard-open="true"] .mobile-bottom-nav {
+    visibility: hidden;
   }
   @media (min-width: 768px) {
+    /* Desktop: klassischer Flow, keine Fixierung nötig. */
     .h-chat-shell {
+      position: static;
+      padding: 0;
+      z-index: auto;
+      overscroll-behavior: auto;
       height: calc(100dvh - 6rem);
     }
   }

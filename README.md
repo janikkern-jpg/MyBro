@@ -3,8 +3,8 @@
 Persönliche Coaching- und Journaling-Webapp mit Chat, Kalender und Plan.
 
 **Stack:** React 19 + TypeScript + Vite · Tailwind CSS v4 · React Router 7 ·
-Supabase (Auth + Postgres mit RLS) · Netlify (Hosting + Serverless Functions) ·
-Anthropic Claude (serverseitig).
+Supabase (Auth + Postgres mit RLS) · Cloudflare Pages (Hosting) + Cloudflare
+Pages Functions (Server-Endpoints) · Anthropic Claude & OpenAI (serverseitig).
 
 ---
 
@@ -16,41 +16,51 @@ Voraussetzungen: **Node 20+** und **npm**.
 # Abhängigkeiten installieren
 npm install
 
-# .env aus Vorlage erstellen und ausfüllen
+# .env aus Vorlage erstellen und ausfüllen (Build-Variablen für Vite)
 Copy-Item .env.example .env
 ```
 
-`.env` mit deinen Werten befüllen:
+`.env` (nur Build-/Frontend-Variablen mit `VITE_`-Präfix):
 
 ```dotenv
 # Frontend – landet im Client-Bundle. Nur öffentliche Werte hier.
 VITE_SUPABASE_URL=https://<projekt>.supabase.co
 VITE_SUPABASE_ANON_KEY=sb_publishable_...
-
-# Server-only. Wird NUR von `netlify dev` bzw. den Netlify Functions gelesen.
-# Niemals mit VITE_-Präfix versehen und niemals ins Frontend importieren.
-ANTHROPIC_API_KEY=sk-ant-...
 ```
+
+Die **serverseitigen Secrets** (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) gehören
+für die Pages-Functions in eine separate Datei `.dev.vars` (Wrangler-
+Konvention):
+
+```dotenv
+# .dev.vars – wird von `wrangler pages dev` gelesen, NICHT von Vite.
+# Kein VITE_-Präfix, sonst würde Vite das ins Client-Bundle mischen.
+ANTHROPIC_API_KEY=sk-ant-...
+OPENAI_API_KEY=sk-...
+```
+
+`.dev.vars` gehört – wie `.env` – in `.gitignore`.
 
 Danach:
 
 ```powershell
-# Nur Frontend (kein Chat, weil /api/chat nicht verfügbar)
+# Nur Frontend (kein Chat, weil /api/* nicht verfügbar)
 npm run dev            # Vite auf http://localhost:5173
 
-# Frontend + Netlify Functions gemeinsam (empfohlen)
-npx netlify dev        # http://localhost:8888  – /api/chat funktioniert
+# Frontend + Pages Functions gemeinsam (empfohlen)
+npm run pages:dev      # Wrangler auf http://localhost:8788 – /api/* funktioniert
 ```
 
-`netlify dev` proxied `/api/*` und `/.netlify/functions/*` an die lokalen
-Functions und lädt `.env` automatisch.
+`npm run pages:dev` startet Vite als Backend-Proxy und hängt die Functions
+aus `functions/` an denselben Origin – `/api/chat`, `/api/smalltalk`,
+`/api/smalltalk-image` und `/api/status` sind damit erreichbar.
 
 ### Function smoke test
 
 ```powershell
 $body = @{ messages = @( @{ role = "user"; content = "Sag PONG." } ) } |
         ConvertTo-Json -Depth 5
-Invoke-RestMethod -Method Post -Uri http://localhost:8888/api/chat `
+Invoke-RestMethod -Method Post -Uri http://localhost:8788/api/chat `
   -ContentType "application/json" -Body $body
 ```
 
@@ -84,9 +94,18 @@ automatisch einen `profiles`-Eintrag und die sieben Standard-Charakter-
 Prinzipien an. RLS erzwingt auf jeder Tabelle `auth.uid() = user_id`, jeder
 Nutzer sieht ausschließlich seine eigenen Zeilen.
 
+Die Migration [supabase/migrations/0002_smalltalk.sql](supabase/migrations/0002_smalltalk.sql)
+ergänzt den Smalltalk-Modus (Prinzipien, Projekte, Konversationen,
+Nachrichten). Ein Trigger auf `profiles` legt beim ersten Login 7 leere
+`smalltalk_principles`-Zeilen an. Die Ansicht *Zuletzt verwendet* filtert
+per Query auf `project_id is null and created_at > now() - interval '30
+days'`; ein automatisches Löschen ist nicht nötig. Optional lässt sich das
+später per Supabase Cron (`pg_cron`) ergänzen – Beispiel-Schedule steht als
+Kommentar am Ende der Migration.
+
 ---
 
-## 3. Deployment auf Netlify
+## 3. Deployment auf Cloudflare Pages
 
 ### 3.1 Repo auf GitHub pushen
 
@@ -101,59 +120,85 @@ git remote add origin https://github.com/<user>/<repo>.git
 git push -u origin main
 ```
 
-Wichtig: `.env` wird durch die `.gitignore` ausgeschlossen und darf **niemals**
-committed werden.
+Wichtig: `.env` und `.dev.vars` werden durch die `.gitignore` ausgeschlossen
+und dürfen **niemals** committed werden.
 
-### 3.2 Site in Netlify anlegen
+### 3.2 Pages-Projekt anlegen
 
-1. In Netlify *Add new site → Import an existing project* wählen und das
-   GitHub-Repo verbinden.
-2. Netlify erkennt [netlify.toml](netlify.toml) und übernimmt Build-Command,
-   Publish-Verzeichnis, Functions-Verzeichnis und den SPA-Redirect
-   automatisch. Manuell nichts überschreiben.
+1. <https://dash.cloudflare.com> öffnen → links **Workers & Pages**.
+2. **Create application** → Tab **Pages** → **Connect to Git**.
+3. GitHub-Konto autorisieren, das Repo auswählen, **Begin setup**.
+4. Build-Einstellungen:
+   - **Framework preset:** *None* (oder *Vite*, beides funktioniert).
+   - **Build command:** `npm run build`
+   - **Build output directory:** `dist`
+   - **Root directory:** leer lassen.
+   - Node-Version: unter *Settings → Environment variables* zusätzlich
+     `NODE_VERSION=20` setzen, falls Cloudflare nicht automatisch Node 20
+     wählt.
+5. **Save and Deploy**.
+
+Cloudflare erkennt automatisch den Ordner `functions/` und deployt jede
+Datei unter `functions/api/*.ts` als Endpoint unter `/api/*`. Der Ordner
+`functions/_shared/` wird durch das führende `_` nicht als Route
+interpretiert und dient nur als Helfer-Modul.
 
 ### 3.3 Umgebungsvariablen setzen
 
-Unter *Site settings → Environment variables* folgende Variablen anlegen
-(Scope: **All scopes** oder mindestens *Builds* + *Functions*):
+Unter *Site → Settings → Environment variables* (getrennt für *Production*
+und *Preview*):
 
-| Variable | Wert | Scope | Zweck |
+| Variable | Wert | Typ | Zweck |
 |---|---|---|---|
-| `VITE_SUPABASE_URL` | `https://<projekt>.supabase.co` | Build | Supabase-Endpoint fürs Frontend |
-| `VITE_SUPABASE_ANON_KEY` | `sb_publishable_...` | Build | Supabase Anon-Key fürs Frontend |
-| `ANTHROPIC_API_KEY` | `sk-ant-...` | **Functions (Runtime)** | Anthropic-API-Key, nur serverseitig |
+| `VITE_SUPABASE_URL` | `https://<projekt>.supabase.co` | **Plaintext** (Build) | Supabase-Endpoint fürs Frontend |
+| `VITE_SUPABASE_ANON_KEY` | `sb_publishable_...` | **Plaintext** (Build) | Supabase Anon-Key fürs Frontend |
+| `ANTHROPIC_API_KEY` | `sk-ant-...` | **Secret** | Anthropic-API-Key, wird von Pages Functions gelesen |
+| `OPENAI_API_KEY` | `sk-...` | **Secret** | OpenAI-Fallback + Bildgenerierung |
 
-Nach dem ersten Deploy: *Deploys → Trigger deploy → Clear cache and deploy site*,
-damit die neuen Env-Werte auch in den Build einfließen.
+Wichtig:
+
+- Die beiden Secrets dürfen **keinen** `VITE_`-Präfix haben – sonst
+  landen sie im Client-Bundle.
+- Nach dem Setzen neuer Variablen einmal *Deployments → latest → Retry
+  deployment* auslösen, damit sie greifen.
 
 ### 3.4 Fertig
 
-- Frontend liegt unter der Netlify-URL (`https://<site>.netlify.app`).
-- Chat-Endpunkt: `/api/chat` (Alias in [netlify.toml](netlify.toml)) bzw.
-  `/.netlify/functions/chat`.
-- SPA-Routen wie `/chat`, `/kalender`, `/plan` werden per Redirect auf
-  `index.html` aufgelöst.
+- Frontend liegt unter der Pages-URL (`https://<projekt>.pages.dev`) bzw.
+  der verknüpften Custom-Domain.
+- Endpoints: `/api/chat`, `/api/smalltalk`, `/api/smalltalk-image`,
+  `/api/status`.
+- SPA-Routen wie `/chat`, `/kalender`, `/plan` werden über
+  [public/_redirects](public/_redirects) auf `index.html` aufgelöst.
+
+> **Übergangszeit:** Die alten Netlify-Dateien ([netlify.toml](netlify.toml)
+> und [netlify/functions/](netlify/functions/)) bleiben absichtlich noch im
+> Repo, bis Cloudflare nachweislich läuft. Sobald das der Fall ist, können
+> beide gelöscht werden.
 
 ---
 
-## 4. Sicherheit: warum `ANTHROPIC_API_KEY` niemals `VITE_`-Präfix bekommt
+## 4. Sicherheit: warum Server-Keys niemals `VITE_`-Präfix bekommen
 
-Vite übernimmt beim Build **nur** Umgebungsvariablen mit dem Präfix `VITE_` in
-das Client-Bundle. Alle anderen Variablen sind ausschließlich zur Build-/Server-
-Zeit sichtbar und landen nicht im ausgelieferten JavaScript.
+Vite übernimmt beim Build **nur** Umgebungsvariablen mit dem Präfix `VITE_`
+in das Client-Bundle. Alle anderen Variablen sind ausschließlich zur Build-/
+Server-Zeit sichtbar und landen nicht im ausgelieferten JavaScript.
 
 Deshalb gilt strikt:
 
-- ✅ `ANTHROPIC_API_KEY=…` in Netlify → *Environment variables* mit Scope
-  **Functions** (und ggf. Builds, falls für die Function beim Deploy nötig).
-  Wird von [netlify/functions/chat.ts](netlify/functions/chat.ts) über
-  `process.env.ANTHROPIC_API_KEY` gelesen.
-- ❌ **Niemals** `VITE_ANTHROPIC_API_KEY=…` verwenden. Das würde den Key als
-  String in `dist/assets/index-*.js` einbrennen und für jeden Besucher der
-  Seite über die Browser-DevTools sichtbar machen.
+- ✅ `ANTHROPIC_API_KEY=…` / `OPENAI_API_KEY=…` in Cloudflare Pages →
+  *Environment variables* als **Secret** setzen. Wird von
+  [functions/api/chat.ts](functions/api/chat.ts),
+  [functions/api/smalltalk.ts](functions/api/smalltalk.ts),
+  [functions/api/smalltalk-image.ts](functions/api/smalltalk-image.ts) und
+  [functions/api/status.ts](functions/api/status.ts) über `context.env`
+  gelesen.
+- ❌ **Niemals** `VITE_ANTHROPIC_API_KEY=…` verwenden. Das würde den Key
+  als String in `dist/assets/index-*.js` einbrennen und für jeden Besucher
+  der Seite über die Browser-DevTools sichtbar machen.
 - ❌ Den Key niemals in Quellcode, Kommentare, Tests, README-Beispiele oder
-  Commit-Messages schreiben. Für lokale Tests immer aus `.env` lesen, `.env`
-  bleibt gitignored.
+  Commit-Messages schreiben. Für lokale Tests immer aus `.dev.vars` lesen,
+  `.dev.vars` bleibt gitignored.
 
 Die Function selbst ruft Anthropic mit dem Key im `x-api-key`-Header auf – der
 Browser sieht nur die Antwort der Function, nie den Header. Ein Grep nach
@@ -170,13 +215,17 @@ Select-String -Path dist\assets\*.js -Pattern "sk-ant-|x-api-key|anthropic\.com"
 ```text
 src/
   pages/          Chat, Kalender, Plan, Login
-  components/    Layout, Navigation, SettingsPanel, Icons
-  lib/            supabase.ts, auth.tsx, bootstrap.ts, chat/*
-netlify/
-  functions/      chat.ts  (Server-Endpoint für Anthropic)
+  components/     Layout, Navigation, SettingsPanel, Icons
+  lib/            supabase.ts, auth.tsx, bootstrap.ts, chat/*, usage.ts
+functions/
+  api/            chat.ts, smalltalk.ts, smalltalk-image.ts, status.ts
+  _shared/        anthropic, openaiText, openaiImage, modelRouting, pricing
 supabase/
-  migrations/     0001_init.sql
-netlify.toml     Build, Functions, Redirects, Dev-Port
+  migrations/     0001_init.sql, 0002_smalltalk.sql, 0003_usage_log.sql
+public/
+  _redirects      SPA-Fallback für Cloudflare Pages
+wrangler.toml     Pages-Projektname + compatibility_date
+netlify.toml      (Legacy – wird nach erfolgreichem Cloudflare-Deploy entfernt)
 ```
 
 ## Skripte
@@ -184,7 +233,7 @@ netlify.toml     Build, Functions, Redirects, Dev-Port
 | Skript | Zweck |
 |---|---|
 | `npm run dev` | Vite dev-server (ohne Functions) |
-| `npx netlify dev` | Vite + Functions gemeinsam (`/api/chat` verfügbar) |
+| `npm run pages:dev` | Vite + Pages Functions gemeinsam (`/api/*` verfügbar) |
 | `npm run build` | Produktions-Build nach `dist/` |
 | `npm run preview` | Vite-Preview des Builds |
 | `npm run lint` | Oxlint über `src/` |
