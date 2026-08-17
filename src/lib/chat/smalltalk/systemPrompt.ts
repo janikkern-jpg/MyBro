@@ -4,7 +4,11 @@ const NEUTRAL_DEFAULT =
   "Du bist ein hilfreicher, freundlicher Alltagsassistent für Fragen, Gespräche und kreative Aufgaben.";
 
 const GUIDANCE =
-  "Antworte auf Deutsch, klar und natürlich. Halte dich kurz, außer der Nutzer bittet um Details.";
+  "Antworte auf Deutsch, klar und natürlich. Halte dich kurz, außer der Nutzer bittet um Details.\n" +
+  "Formatiere strukturierte Informationen (Listen von Dingen mit mehreren " +
+  "Eigenschaften, Vergleiche, Schritt-für-Schritt-Anleitungen) als Markdown – " +
+  "Tabellen für tabellarische Daten (z. B. Firmenlisten mit Name/Adresse/etc.), " +
+  "Listen für Aufzählungen, **Fett** für Hervorhebungen. Bei einfachem Gesprächstext bleibt es beim Fließtext.";
 
 // Wir liefern zusätzlich das aktuelle Datum, damit das Modell selbst
 // erkennt, wie alt sein Trainingswissen relativ dazu ist – das erhöht

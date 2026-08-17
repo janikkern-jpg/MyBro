@@ -58,6 +58,7 @@ import type {
 } from "../lib/chat/smalltalk/types";
 import { ChatComposer } from "../components/ChatComposer";
 import { ChatImage } from "../components/ChatImage";
+import { MarkdownContent } from "../components/MarkdownContent";
 import {
   uploadChatImage,
   type PreparedImage,
@@ -535,16 +536,22 @@ function SmalltalkBubble({
     <div className={isUser ? "flex justify-end" : "flex justify-start"}>
       <div
         className={[
-          "max-w-[85%] whitespace-pre-wrap break-words rounded-2xl px-4 py-2.5 text-sm leading-relaxed",
+          "max-w-[85%] break-words rounded-2xl px-4 py-2.5 text-sm leading-relaxed",
           isUser
-            ? "rounded-br-md bg-accent text-bg"
+            ? "whitespace-pre-wrap rounded-br-md bg-accent text-bg"
             : "rounded-bl-md border border-border bg-bg-elevated text-text",
         ].join(" ")}
       >
         {imageUrl ? (
           <ChatImage url={imageUrl} alt={displayText || "Angehängtes Bild"} />
         ) : null}
-        {displayText ? <div>{displayText}</div> : null}
+        {displayText ? (
+          isUser ? (
+            <div>{displayText}</div>
+          ) : (
+            <MarkdownContent text={displayText} />
+          )
+        ) : null}
         {sources.length > 0 ? (
           <div className="mt-2 border-t border-border/60 pt-2 text-xs text-text-muted">
             <div className="mb-1 font-medium">Quellen:</div>
@@ -1211,16 +1218,18 @@ function MessageBubble({
     <div className={isUser ? "flex justify-end" : "flex justify-start"}>
       <div
         className={[
-          "max-w-[85%] whitespace-pre-wrap break-words rounded-2xl px-4 py-2.5 text-sm leading-relaxed",
+          "max-w-[85%] break-words rounded-2xl px-4 py-2.5 text-sm leading-relaxed",
           isUser
-            ? "rounded-br-md bg-accent text-bg"
+            ? "whitespace-pre-wrap rounded-br-md bg-accent text-bg"
             : "rounded-bl-md border border-border bg-bg-elevated text-text",
         ].join(" ")}
       >
         {imageUrl ? (
           <ChatImage url={imageUrl} alt={content || "Angehängtes Bild"} />
         ) : null}
-        {content ? <div>{content}</div> : null}
+        {content ? (
+          isUser ? <div>{content}</div> : <MarkdownContent text={content} />
+        ) : null}
       </div>
     </div>
   );
