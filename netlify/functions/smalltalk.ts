@@ -19,9 +19,6 @@ import {
 } from "./_shared/createFile";
 import {
   GENERATE_IMAGE_TOOL,
-  generateImageFromToolInput,
-  OPENAI_IMAGE_UNVERIFIED_MSG,
-  type GeneratedImage,
 } from "./_shared/generateImage";
 
 // Smalltalk-Chat-Endpoint. Eigenständiger Zweig (kein MyBro-Kontext), mit:
@@ -33,11 +30,11 @@ import {
 //   lädt sie in den Supabase-Bucket `chat-files` hoch (Auth: das
 //   Access-Token des Users → RLS greift) und gibt die Download-URL als
 //   tool_result zurück; die Schleife läuft, bis Claude fertig ist.
-// - `generate_image`-Tool (client-side, Tool-Loop): Claude ruft es auf,
-//   wenn erkennbar ein Bild gewollt ist. Server ruft die OpenAI Image-
-//   API (gpt-image-1) auf, lädt das PNG in den `chat-images`-Bucket,
-//   liefert die Public-URL als tool_result zurück. 403-Fehler wird als
-//   klarer Klartext an Claude gemeldet (Org-Verification-Hinweis).
+// - `generate_image`-Tool: hier wird der OpenAI-Aufruf NICHT sofort
+//   ausgeführt, sondern das Frontend bekommt {status:"generating_image",
+//   imagePrompt} zurück und ruft den zweiten Endpoint `generate-image`
+//   auf. So kann die UI einen dedizierten "Bild wird generiert"-Loader
+//   zeigen, statt sekundenlang auf der Text-Tippanzeige zu hängen.
 
 type SmalltalkRequestBody = {
   messages: AnthropicMessage[];
@@ -110,6 +107,20 @@ function logWebSearchTelemetry(
 
 type ContentBlockJson = Record<string, unknown>;
 
+// Ergebnis des Loops:
+//  - "final"                    → normaler Text-/create_file-Fall,
+//    outcome ist die letzte Anthropic-Response.
+//  - "generate_image_requested" → Claude hat das generate_image-Tool
+//    aufgerufen; der eigentliche OpenAI-Call wird nicht hier gemacht,
+//    sondern der Client soll den zweiten Endpoint anstoßen.
+type ToolLoopResult =
+  | { kind: "final"; outcome: FetchOutcome }
+  | {
+      kind: "generate_image_requested";
+      prompt: string;
+      size: string | null;
+    };
+
 /**
  * Sammelt alle `tool_use`-Blöcke, die auf ein *client*-Tool zeigen
  * (aktuell `create_file` und `generate_image`). Server-Tools
@@ -141,15 +152,13 @@ async function runToolLoop(opts: {
   usageBucket: UsageRecord[];
   providerTag: string;
   createdFiles: CreatedFile[];
-  createdImages: GeneratedImage[];
   fileEnv: {
     userId: string;
     accessToken: string;
     supabaseUrl: string;
     supabaseAnonKey: string;
   } | null;
-  openAIKey: string;
-}): Promise<FetchOutcome> {
+}): Promise<ToolLoopResult> {
   const messages = [
     ...((opts.initialBody.messages as AnthropicMessage[]) ?? []),
   ];
@@ -165,14 +174,14 @@ async function runToolLoop(opts: {
     lastOutcome = outcome;
 
     if (outcome.kind !== "response" || !outcome.response.ok) {
-      return outcome;
+      return { kind: "final", outcome };
     }
 
     let parsed: Record<string, unknown>;
     try {
       parsed = JSON.parse(outcome.rawText) as Record<string, unknown>;
     } catch {
-      return outcome;
+      return { kind: "final", outcome };
     }
 
     const mainUsage = usageFromAnthropicJson(
@@ -189,7 +198,29 @@ async function runToolLoop(opts: {
     const toolUses = extractClientToolUses(parsed);
 
     if (stopReason !== "tool_use" || toolUses.length === 0) {
-      return outcome;
+      return { kind: "final", outcome };
+    }
+
+    // Bild-Wunsch hat Priorität: sobald Claude in diesem Turn
+    // `generate_image` anfordert, brechen wir den Loop ab und lassen
+    // das Frontend den zweiten Endpoint aufrufen. Damit sieht der
+    // Nutzer sofort einen dedizierten "Bild wird generiert"-Loader.
+    const imageUse = toolUses.find((u) => u.name === "generate_image");
+    if (imageUse) {
+      const input =
+        imageUse.input && typeof imageUse.input === "object"
+          ? (imageUse.input as Record<string, unknown>)
+          : {};
+      const prompt =
+        typeof input.prompt === "string" ? input.prompt.trim() : "";
+      const size =
+        typeof input.size === "string" && input.size.trim().length > 0
+          ? input.size.trim()
+          : null;
+      console.log(
+        `[smalltalk] short-circuit: generate_image requested (promptLen=${prompt.length}, size=${size ?? "default"})`,
+      );
+      return { kind: "generate_image_requested", prompt, size };
     }
 
     // Assistant-Turn (die komplette content-Liste!) übernehmen und
@@ -243,61 +274,15 @@ async function runToolLoop(opts: {
       }
 
       if (use.name === "generate_image") {
-        if (!opts.fileEnv || !opts.openAIKey) {
-          toolResultBlocks.push({
-            type: "tool_result",
-            tool_use_id: use.id,
-            is_error: true,
-            content:
-              "Bildgenerierung nicht verfügbar: der Nutzer ist nicht authentifiziert oder OPENAI_API_KEY/Supabase sind nicht konfiguriert.",
-          });
-          continue;
-        }
-        const startedAt = Date.now();
-        const outcome = await generateImageFromToolInput(use.input, {
-          userId: opts.fileEnv.userId,
-          accessToken: opts.fileEnv.accessToken,
-          supabaseUrl: opts.fileEnv.supabaseUrl,
-          supabaseAnonKey: opts.fileEnv.supabaseAnonKey,
-          openAIKey: opts.openAIKey,
+        // Sollte durch den Short-Circuit oben nie erreicht werden.
+        // Trotzdem defensiv absichern, damit Claude nicht endlos loopt.
+        toolResultBlocks.push({
+          type: "tool_result",
+          tool_use_id: use.id,
+          is_error: true,
+          content:
+            "Bildgenerierung wird vom Frontend übernommen – dieses Tool sollte serverseitig nicht ausgeführt werden.",
         });
-        const durationMs = Date.now() - startedAt;
-
-        if (outcome.ok) {
-          if (outcome.usage) opts.usageBucket.push(outcome.usage);
-          opts.createdImages.push(outcome.image);
-          console.log(
-            `[smalltalk] generate_image ok model=gpt-image-1 size=${outcome.image.size} durationMs=${durationMs} cost=${outcome.usage?.estimated_cost_usd ?? 0} ts=${new Date().toISOString()}`,
-          );
-          toolResultBlocks.push({
-            type: "tool_result",
-            tool_use_id: use.id,
-            content: JSON.stringify({
-              ok: true,
-              url: outcome.image.url,
-              size: outcome.image.size,
-              note:
-                "Das Bild wurde erzeugt und wird direkt unter der Nachricht angezeigt. Wiederhole die URL NICHT im Text; sag höchstens einen kurzen Satz dazu.",
-            }),
-          });
-        } else {
-          console.warn(
-            `[smalltalk] generate_image failed kind=${outcome.kind} status=${outcome.status ?? "n/a"} durationMs=${durationMs} ts=${new Date().toISOString()}`,
-          );
-          // 403 (Org-Verification) verpacken wir mit dem exakten
-          // Klartext, den der Nutzer sehen soll – der System-Prompt
-          // weist Claude an, diesen Satz wörtlich zu zitieren.
-          const content =
-            outcome.kind === "unauthorized_org"
-              ? `${OPENAI_IMAGE_UNVERIFIED_MSG} Bitte teile dem Nutzer GENAU diese Meldung in einem einzigen Satz mit und stelle keine Nachfragen.`
-              : outcome.message;
-          toolResultBlocks.push({
-            type: "tool_result",
-            tool_use_id: use.id,
-            is_error: true,
-            content,
-          });
-        }
         continue;
       }
 
@@ -321,12 +306,13 @@ async function runToolLoop(opts: {
   console.warn(
     `[smalltalk] Tool-Loop hat MAX_TOOL_ITERATIONS (${MAX_TOOL_ITERATIONS}) erreicht.`,
   );
-  return (
-    lastOutcome ?? {
+  return {
+    kind: "final",
+    outcome: lastOutcome ?? {
       kind: "network-error",
       error: new Error("Tool-Loop ohne Antwort."),
-    }
-  );
+    },
+  };
 }
 
 async function respondFromOutcome(
@@ -337,7 +323,6 @@ async function respondFromOutcome(
     providerTag: string;
     usageBucket: UsageRecord[];
     createdFiles: CreatedFile[];
-    createdImages: GeneratedImage[];
   },
 ): Promise<Response> {
   if (outcome.kind === "response" && outcome.response.ok) {
@@ -349,7 +334,6 @@ async function respondFromOutcome(
         ...parsed,
         _usage: ctx.usageBucket,
         _files: ctx.createdFiles,
-        _images: ctx.createdImages,
       });
     } catch {
       console.error("Anthropic-Response konnte nicht als JSON geparst werden.");
@@ -378,7 +362,6 @@ async function respondFromOutcome(
           ...openAIOutcome.anthropicShaped,
           _usage: ctx.usageBucket,
           _files: ctx.createdFiles,
-          _images: ctx.createdImages,
         });
       }
 
@@ -493,15 +476,11 @@ export default async (req: Request, _context: Context): Promise<Response> => {
   const usageBucket: UsageRecord[] = [];
   if (selection.classifierUsage) usageBucket.push(selection.classifierUsage);
 
-  // OpenAI-Key wird sowohl für den Text-Fallback als auch für das
-  // generate_image-Tool gebraucht. Wenn er fehlt, aktivieren wir das
-  // Tool schlicht nicht.
-  const openAIKey = process.env.OPENAI_API_KEY || "";
-
-  // File-/Image-Env: nur wenn Token + Supabase-Konfig da sind, bieten
-  // wir create_file/generate_image überhaupt an. So bleibt der Loop
+  // File-Env: nur wenn Token + Supabase-Konfig da sind, bieten wir
+  // create_file/generate_image überhaupt an. So bleibt der Loop
   // leichtgewichtig, wenn z. B. ein alter Client kein Bearer-Token
-  // schickt.
+  // schickt. Der OpenAI-Key selbst wird HIER nicht mehr gebraucht –
+  // die eigentliche Bildgenerierung passiert im zweiten Endpoint.
   const accessToken = readBearer(req);
   const userId = parseJwtSubject(accessToken);
   const supabaseUrl = process.env.SUPABASE_URL || "";
@@ -512,14 +491,13 @@ export default async (req: Request, _context: Context): Promise<Response> => {
   const fileEnv = fileEnvReady
     ? { userId, accessToken, supabaseUrl, supabaseAnonKey }
     : null;
-  const imageToolEnabled = fileEnvReady && Boolean(openAIKey);
 
   const webSearchDisabled = process.env.SMALLTALK_DISABLE_WEB_SEARCH === "1";
 
   const tools: unknown[] = [];
   if (!webSearchDisabled) tools.push(WEB_SEARCH_TOOL);
   if (fileEnvReady) tools.push(CREATE_FILE_TOOL);
-  if (imageToolEnabled) tools.push(GENERATE_IMAGE_TOOL);
+  if (fileEnvReady) tools.push(GENERATE_IMAGE_TOOL);
 
   const anthropicBody: Record<string, unknown> = {
     max_tokens: MAX_TOKENS,
@@ -532,38 +510,38 @@ export default async (req: Request, _context: Context): Promise<Response> => {
 
   if (!fileEnvReady) {
     console.warn(
-      "[smalltalk] create_file-Tool nicht aktiv:" +
+      "[smalltalk] create_file/generate_image-Tools nicht aktiv:" +
         ` token=${accessToken ? "yes" : "no"}, userId=${userId ? "yes" : "no"},` +
         ` SUPABASE_URL=${supabaseUrl ? "yes" : "no"}, SUPABASE_ANON_KEY=${supabaseAnonKey ? "yes" : "no"}.`,
     );
   }
-  if (!imageToolEnabled) {
-    console.warn(
-      `[smalltalk] generate_image-Tool nicht aktiv: fileEnvReady=${fileEnvReady}, OPENAI_API_KEY=${openAIKey ? "yes" : "no"}.`,
-    );
-  }
 
   const createdFiles: CreatedFile[] = [];
-  const createdImages: GeneratedImage[] = [];
-  const outcome = await runToolLoop({
+  const result = await runToolLoop({
     initialBody: anthropicBody,
     apiKey,
     models: selection.models,
     usageBucket,
     providerTag: `claude-smalltalk-${selection.models[0]}`,
     createdFiles,
-    createdImages,
     fileEnv,
-    openAIKey,
   });
 
-  return respondFromOutcome(outcome, {
+  if (result.kind === "generate_image_requested") {
+    return jsonResponse(200, {
+      status: "generating_image",
+      imagePrompt: result.prompt,
+      imageSize: result.size,
+      _usage: usageBucket,
+    });
+  }
+
+  return respondFromOutcome(result.outcome, {
     systemPrompt,
     messages,
     providerTag: `claude-smalltalk-${selection.models[0]}`,
     usageBucket,
     createdFiles,
-    createdImages,
   });
 };
 

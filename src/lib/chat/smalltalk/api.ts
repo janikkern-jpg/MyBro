@@ -38,13 +38,7 @@ function extractError(json: unknown, status: number): string {
   return `Anfrage fehlgeschlagen (HTTP ${status}).`;
 }
 
-export async function callSmalltalkText(payload: {
-  messages: StApiMessage[];
-  systemPrompt: string;
-}): Promise<StChatResponse> {
-  // Access-Token mitschicken, damit der Server das `create_file`-Tool
-  // aktivieren kann (Upload in den Supabase-Bucket "chat-files" läuft
-  // über genau dieses Token, RLS erzwingt den eigenen Unterordner).
+async function authorizedHeaders(): Promise<Record<string, string>> {
   const {
     data: { session },
   } = await supabase.auth.getSession();
@@ -54,7 +48,17 @@ export async function callSmalltalkText(payload: {
   if (session?.access_token) {
     headers.authorization = `Bearer ${session.access_token}`;
   }
+  return headers;
+}
 
+export async function callSmalltalkText(payload: {
+  messages: StApiMessage[];
+  systemPrompt: string;
+}): Promise<StChatResponse> {
+  // Access-Token mitschicken, damit der Server die client-seitigen Tools
+  // (`create_file`, `generate_image`) aktivieren kann – die Uploads
+  // laufen über genau dieses Token, RLS erzwingt den eigenen Unterordner.
+  const headers = await authorizedHeaders();
   const res = await fetch("/api/smalltalk", {
     method: "POST",
     headers,
@@ -70,6 +74,59 @@ export async function callSmalltalkText(payload: {
     throw err;
   }
   return json as StChatResponse;
+}
+
+/**
+ * Zweite Phase der Bildgenerierung: der `/api/smalltalk`-Endpoint hat
+ * `{status:"generating_image", imagePrompt}` geliefert, und wir stoßen
+ * jetzt den eigentlichen OpenAI-Aufruf an. Der Server erledigt Aufruf,
+ * Upload nach `chat-images` und liefert die public URL zurück.
+ *
+ * Fehler werden als `SmalltalkApiError` geworfen; `details` enthält im
+ * Erfolgs- und im 403-Fall auch das `kind`-Feld (u. a. `unauthorized_org`
+ * für den Org-Verification-Stolperstein), damit der Client zwischen
+ * "kaputt" und "muss noch freigeschaltet werden" unterscheiden kann.
+ */
+export async function callGenerateImage(payload: {
+  prompt: string;
+  size?: string | null;
+}): Promise<{ url: string; size: string; prompt: string; path: string }> {
+  const headers = await authorizedHeaders();
+  const body: Record<string, unknown> = { prompt: payload.prompt };
+  if (payload.size) body.size = payload.size;
+  const res = await fetch("/api/generate-image", {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
+  const json = await parseJsonSafe(res);
+  if (!res.ok || !isImageOkPayload(json)) {
+    const err: SmalltalkApiError = {
+      status: res.status,
+      message: extractError(json, res.status),
+      details: json,
+    };
+    throw err;
+  }
+  return {
+    url: json.url,
+    size: json.size,
+    prompt: json.prompt,
+    path: typeof json.path === "string" ? json.path : "",
+  };
+}
+
+function isImageOkPayload(
+  json: unknown,
+): json is { url: string; size: string; prompt: string; path?: string } {
+  if (!json || typeof json !== "object") return false;
+  const rec = json as Record<string, unknown>;
+  return (
+    rec.ok === true &&
+    typeof rec.url === "string" &&
+    typeof rec.size === "string" &&
+    typeof rec.prompt === "string"
+  );
 }
 
 export async function callSmalltalkImage(payload: {

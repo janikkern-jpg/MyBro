@@ -18,9 +18,6 @@ import {
 } from "../_shared/createFile";
 import {
   GENERATE_IMAGE_TOOL,
-  generateImageFromToolInput,
-  OPENAI_IMAGE_UNVERIFIED_MSG,
-  type GeneratedImage,
 } from "../_shared/generateImage";
 import type { Env, PagesHandler } from "../_shared/pages";
 
@@ -92,6 +89,15 @@ function logWebSearchTelemetry(
 
 type ContentBlockJson = Record<string, unknown>;
 
+// Ergebnis des Loops (siehe Netlify-Variante für Details).
+type ToolLoopResult =
+  | { kind: "final"; outcome: FetchOutcome }
+  | {
+      kind: "generate_image_requested";
+      prompt: string;
+      size: string | null;
+    };
+
 function extractClientToolUses(
   parsed: Record<string, unknown>,
 ): Array<{ id: string; name: string; input: unknown }> {
@@ -117,15 +123,13 @@ async function runToolLoop(opts: {
   usageBucket: UsageRecord[];
   providerTag: string;
   createdFiles: CreatedFile[];
-  createdImages: GeneratedImage[];
   fileEnv: {
     userId: string;
     accessToken: string;
     supabaseUrl: string;
     supabaseAnonKey: string;
   } | null;
-  openAIKey: string;
-}): Promise<FetchOutcome> {
+}): Promise<ToolLoopResult> {
   const messages = [
     ...((opts.initialBody.messages as AnthropicMessage[]) ?? []),
   ];
@@ -141,14 +145,14 @@ async function runToolLoop(opts: {
     lastOutcome = outcome;
 
     if (outcome.kind !== "response" || !outcome.response.ok) {
-      return outcome;
+      return { kind: "final", outcome };
     }
 
     let parsed: Record<string, unknown>;
     try {
       parsed = JSON.parse(outcome.rawText) as Record<string, unknown>;
     } catch {
-      return outcome;
+      return { kind: "final", outcome };
     }
 
     const mainUsage = usageFromAnthropicJson(
@@ -167,7 +171,23 @@ async function runToolLoop(opts: {
     if (stopReason !== "tool_use" || toolUses.length === 0) {
       return outcome;
     }
-
+    const imageUse = toolUses.find((u) => u.name === "generate_image");
+    if (imageUse) {
+      const input =
+        imageUse.input && typeof imageUse.input === "object"
+          ? (imageUse.input as Record<string, unknown>)
+          : {};
+      const prompt =
+        typeof input.prompt === "string" ? input.prompt.trim() : "";
+      const size =
+        typeof input.size === "string" && input.size.trim().length > 0
+          ? input.size.trim()
+          : null;
+      console.log(
+        `[smalltalk] short-circuit: generate_image requested (promptLen=${prompt.length}, size=${size ?? "default"})`,
+      );
+      return { kind: "generate_image_requested", prompt, size };
+    }
     messages.push({
       role: "assistant",
       content: parsed.content as unknown,
@@ -217,58 +237,13 @@ async function runToolLoop(opts: {
       }
 
       if (use.name === "generate_image") {
-        if (!opts.fileEnv || !opts.openAIKey) {
-          toolResultBlocks.push({
-            type: "tool_result",
-            tool_use_id: use.id,
-            is_error: true,
-            content:
-              "Bildgenerierung nicht verfügbar: der Nutzer ist nicht authentifiziert oder OPENAI_API_KEY/Supabase sind nicht konfiguriert.",
-          });
-          continue;
-        }
-        const startedAt = Date.now();
-        const outcome = await generateImageFromToolInput(use.input, {
-          userId: opts.fileEnv.userId,
-          accessToken: opts.fileEnv.accessToken,
-          supabaseUrl: opts.fileEnv.supabaseUrl,
-          supabaseAnonKey: opts.fileEnv.supabaseAnonKey,
-          openAIKey: opts.openAIKey,
+        toolResultBlocks.push({
+          type: "tool_result",
+          tool_use_id: use.id,
+          is_error: true,
+          content:
+            "Bildgenerierung wird vom Frontend übernommen – dieses Tool sollte serverseitig nicht ausgeführt werden.",
         });
-        const durationMs = Date.now() - startedAt;
-
-        if (outcome.ok) {
-          if (outcome.usage) opts.usageBucket.push(outcome.usage);
-          opts.createdImages.push(outcome.image);
-          console.log(
-            `[smalltalk] generate_image ok model=gpt-image-1 size=${outcome.image.size} durationMs=${durationMs} cost=${outcome.usage?.estimated_cost_usd ?? 0} ts=${new Date().toISOString()}`,
-          );
-          toolResultBlocks.push({
-            type: "tool_result",
-            tool_use_id: use.id,
-            content: JSON.stringify({
-              ok: true,
-              url: outcome.image.url,
-              size: outcome.image.size,
-              note:
-                "Das Bild wurde erzeugt und wird direkt unter der Nachricht angezeigt. Wiederhole die URL NICHT im Text; sag höchstens einen kurzen Satz dazu.",
-            }),
-          });
-        } else {
-          console.warn(
-            `[smalltalk] generate_image failed kind=${outcome.kind} status=${outcome.status ?? "n/a"} durationMs=${durationMs} ts=${new Date().toISOString()}`,
-          );
-          const content =
-            outcome.kind === "unauthorized_org"
-              ? `${OPENAI_IMAGE_UNVERIFIED_MSG} Bitte teile dem Nutzer GENAU diese Meldung in einem einzigen Satz mit und stelle keine Nachfragen.`
-              : outcome.message;
-          toolResultBlocks.push({
-            type: "tool_result",
-            tool_use_id: use.id,
-            is_error: true,
-            content,
-          });
-        }
         continue;
       }
 
@@ -289,12 +264,13 @@ async function runToolLoop(opts: {
   console.warn(
     `[smalltalk] Tool-Loop hat MAX_TOOL_ITERATIONS (${MAX_TOOL_ITERATIONS}) erreicht.`,
   );
-  return (
-    lastOutcome ?? {
+  return {
+    kind: "final",
+    outcome: lastOutcome ?? {
       kind: "network-error",
       error: new Error("Tool-Loop ohne Antwort."),
-    }
-  );
+    },
+  };
 }
 
 async function respondFromOutcome(
@@ -306,7 +282,6 @@ async function respondFromOutcome(
     providerTag: string;
     usageBucket: UsageRecord[];
     createdFiles: CreatedFile[];
-    createdImages: GeneratedImage[];
   },
 ): Promise<Response> {
   if (outcome.kind === "response" && outcome.response.ok) {
@@ -317,7 +292,6 @@ async function respondFromOutcome(
         ...parsed,
         _usage: ctx.usageBucket,
         _files: ctx.createdFiles,
-        _images: ctx.createdImages,
       });
     } catch {
       console.error("Anthropic-Response konnte nicht als JSON geparst werden.");
@@ -346,7 +320,6 @@ async function respondFromOutcome(
           ...openAIOutcome.anthropicShaped,
           _usage: ctx.usageBucket,
           _files: ctx.createdFiles,
-          _images: ctx.createdImages,
         });
       }
 
@@ -455,21 +428,19 @@ export const onRequestPost: PagesHandler = async ({ request, env }) => {
   const userId = parseJwtSubject(accessToken);
   const supabaseUrl = env.SUPABASE_URL || "";
   const supabaseAnonKey = env.SUPABASE_ANON_KEY || "";
-  const openAIKey = env.OPENAI_API_KEY || "";
   const fileEnvReady = Boolean(
     accessToken && userId && supabaseUrl && supabaseAnonKey,
   );
   const fileEnv = fileEnvReady
     ? { userId, accessToken, supabaseUrl, supabaseAnonKey }
     : null;
-  const imageToolEnabled = fileEnvReady && Boolean(openAIKey);
 
   const webSearchDisabled = env.SMALLTALK_DISABLE_WEB_SEARCH === "1";
 
   const tools: unknown[] = [];
   if (!webSearchDisabled) tools.push(WEB_SEARCH_TOOL);
   if (fileEnvReady) tools.push(CREATE_FILE_TOOL);
-  if (imageToolEnabled) tools.push(GENERATE_IMAGE_TOOL);
+  if (fileEnvReady) tools.push(GENERATE_IMAGE_TOOL);
 
   const anthropicBody: Record<string, unknown> = {
     max_tokens: MAX_TOKENS,
@@ -482,38 +453,38 @@ export const onRequestPost: PagesHandler = async ({ request, env }) => {
 
   if (!fileEnvReady) {
     console.warn(
-      "[smalltalk] create_file-Tool nicht aktiv:" +
+      "[smalltalk] create_file/generate_image-Tools nicht aktiv:" +
         ` token=${accessToken ? "yes" : "no"}, userId=${userId ? "yes" : "no"},` +
         ` SUPABASE_URL=${supabaseUrl ? "yes" : "no"}, SUPABASE_ANON_KEY=${supabaseAnonKey ? "yes" : "no"}.`,
     );
   }
-  if (!imageToolEnabled) {
-    console.warn(
-      `[smalltalk] generate_image-Tool nicht aktiv: fileEnvReady=${fileEnvReady}, OPENAI_API_KEY=${openAIKey ? "yes" : "no"}.`,
-    );
-  }
 
   const createdFiles: CreatedFile[] = [];
-  const createdImages: GeneratedImage[] = [];
-  const outcome = await runToolLoop({
+  const result = await runToolLoop({
     initialBody: anthropicBody,
     apiKey,
     models: selection.models,
     usageBucket,
     providerTag: `claude-smalltalk-${selection.models[0]}`,
     createdFiles,
-    createdImages,
     fileEnv,
-    openAIKey,
   });
 
-  return respondFromOutcome(outcome, {
+  if (result.kind === "generate_image_requested") {
+    return jsonResponse(200, {
+      status: "generating_image",
+      imagePrompt: result.prompt,
+      imageSize: result.size,
+      _usage: usageBucket,
+    });
+  }
+
+  return respondFromOutcome(result.outcome, {
     env,
     systemPrompt,
     messages,
     providerTag: `claude-smalltalk-${selection.models[0]}`,
     usageBucket,
     createdFiles,
-    createdImages,
   });
 };

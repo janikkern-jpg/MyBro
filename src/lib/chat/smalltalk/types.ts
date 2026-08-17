@@ -77,6 +77,13 @@ export type StChatResponse = {
   // im `chat-images`-Bucket – der Client speichert sie in image_url der
   // Assistant-Nachricht und rendert sie mit ChatImage.
   _images?: StGeneratedImage[];
+  // Sonderfall: Kurzschluss-Antwort. Wenn Claude in seiner ersten Runde
+  // das Tool `generate_image` verlangt hat, antwortet der Server NICHT
+  // mit fertigem Content, sondern signalisiert dem Frontend, dass jetzt
+  // der zweite Endpoint (`/api/generate-image`) angestoßen werden soll.
+  status?: "generating_image";
+  imagePrompt?: string;
+  imageSize?: string | null;
 };
 
 // Kompakte, in `content` persistierbare Quellenangabe.

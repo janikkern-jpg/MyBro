@@ -28,6 +28,7 @@ import {
   type ToolUseBlock,
 } from "../lib/chat/types";
 import {
+  callGenerateImage,
   callSmalltalkText,
   extractAssistantText,
   extractFiles,
@@ -208,6 +209,13 @@ function SmalltalkChat() {
   const [messages, setMessages] = useState<SmalltalkMessage[]>([]);
   const [input, setInput] = useState("");
   const [isSending, setIsSending] = useState(false);
+  // Nicht-null, sobald der Smalltalk-Endpoint {status:"generating_image"}
+  // geliefert hat und wir auf das Ergebnis von /api/generate-image warten.
+  // Ersetzt in dieser Zeit die generische Tippanzeige durch einen
+  // dedizierten "Bild wird generiert…"-Loader.
+  const [pendingImage, setPendingImage] = useState<{ prompt: string } | null>(
+    null,
+  );
   const [error, setError] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
   const [projectDialogOpen, setProjectDialogOpen] = useState(false);
@@ -279,7 +287,7 @@ function SmalltalkChat() {
     const el = scrollRef.current;
     if (!el) return;
     el.scrollTop = el.scrollHeight;
-  }, [messages, isSending]);
+  }, [messages, isSending, pendingImage]);
 
   const ensureConversation = useCallback(
     async (firstMessage: string): Promise<SmalltalkConversation> => {
@@ -377,6 +385,44 @@ function SmalltalkChat() {
               ),
             );
           }
+        }
+
+        // Kurzschluss-Antwort: Claude will ein Bild, das Backend hat
+        // bewusst NICHT auf OpenAI gewartet, damit wir jetzt einen
+        // dedizierten Loader zeigen können, während Phase 2 läuft.
+        if (response.status === "generating_image") {
+          const imgPrompt = (response.imagePrompt ?? "").trim();
+          setPendingImage({ prompt: imgPrompt });
+          try {
+            const result = await callGenerateImage({
+              prompt: imgPrompt,
+              size: response.imageSize ?? null,
+            });
+            const assistantRow = await insertMessage({
+              conversationId: conv.id,
+              role: "assistant",
+              content: "",
+              imageUrl: result.url,
+            });
+            setMessages((prev) => [...prev, assistantRow]);
+          } catch (imgErr) {
+            const message =
+              imgErr && typeof imgErr === "object" && "message" in imgErr
+                ? String((imgErr as { message: unknown }).message)
+                : "Bild konnte nicht erzeugt werden.";
+            // Fehler landet als eigene Assistant-Nachricht genau dort,
+            // wo sonst das Bild erschienen wäre – kein generischer
+            // Chat-Fehler-Banner am oberen Rand.
+            const assistantRow = await insertMessage({
+              conversationId: conv.id,
+              role: "assistant",
+              content: `⚠️ ${message}`,
+            });
+            setMessages((prev) => [...prev, assistantRow]);
+          } finally {
+            setPendingImage(null);
+          }
+          return true;
         }
 
         const assistantText = extractAssistantText(response);
@@ -489,7 +535,11 @@ function SmalltalkChat() {
           />
         ))}
 
-        {isSending ? <TypingIndicator /> : null}
+        {pendingImage ? (
+          <ImageGeneratingIndicator />
+        ) : isSending ? (
+          <TypingIndicator />
+        ) : null}
       </div>
 
       {error ? (
@@ -1318,6 +1368,26 @@ function TypingIndicator() {
         <Dot delay="0ms" />
         <Dot delay="150ms" />
         <Dot delay="300ms" />
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Loader für Phase 2 der Bildgenerierung. Ersetzt die Tippanzeige,
+ * solange /api/generate-image läuft, damit Nutzer:innen sofort sehen,
+ * dass jetzt ein Bild gebaut wird (kann deutlich länger dauern als
+ * eine reine Textantwort).
+ */
+function ImageGeneratingIndicator() {
+  return (
+    <div className="flex justify-start">
+      <div className="flex items-center gap-2 rounded-2xl rounded-bl-md border border-border bg-bg-elevated px-4 py-3 text-sm text-text-muted">
+        <span
+          className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-accent/30 border-t-accent"
+          aria-hidden="true"
+        />
+        <span>Bild wird generiert…</span>
       </div>
     </div>
   );
