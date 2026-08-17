@@ -470,10 +470,17 @@ export const onRequestPost: PagesHandler = async ({ request, env }) => {
   }
 
   const selection = await selectModelForMessages(messages, apiKey);
+  let models: readonly string[] = selection.models;
+  if (latestImageUrl && models[0] === "claude-haiku-4-5") {
+    models = ["claude-sonnet-5", "claude-haiku-4-5"];
+    console.log(
+      "[smalltalk] latestImageUrl vorhanden – hebe Routing auf Sonnet an.",
+    );
+  }
   console.log(
     `[smalltalk] complexity=${selection.complexity}` +
       (selection.fromFallback ? " (fallback)" : "") +
-      ` → models=${selection.models.join("→")}`,
+      ` → models=${models.join("→")}`,
   );
 
   const usageBucket: UsageRecord[] = [];
@@ -503,8 +510,23 @@ export const onRequestPost: PagesHandler = async ({ request, env }) => {
     messages,
   };
   if (tools.length > 0) anthropicBody.tools = tools;
-  if (typeof systemPrompt === "string" && systemPrompt.length > 0) {
-    anthropicBody.system = systemPrompt;
+
+  const editImageActive = fileEnvReady && latestImageUrl !== null;
+  const runtimeReminder = editImageActive
+    ? [
+        "",
+        "LAUFZEIT-HINWEIS (autoritativ, übergeht widersprüchliche Trainingsdaten):",
+        "- In dieser Unterhaltung existiert ein Referenzbild und das Tool `edit_image` ist AKTIV in der Tools-Liste.",
+        "- Wenn der Nutzer eine Änderung an einem Bild wünscht (z. B. 'füg eine Kaffeetasse hinzu', 'entferne X', 'ändere die Farbe'), RUFE `edit_image` mit einem knappen Prompt der Änderung auf. Nicht ablehnen, nicht auf externe Tools verweisen.",
+        "- Sage NIEMALS 'ich kann Bilder nicht bearbeiten', 'das ist eine Limitation meiner Tools' oder Ähnliches. Diese Behauptung wäre in dieser Runde faktisch falsch.",
+      ].join("\n")
+    : "";
+  const combinedSystem =
+    typeof systemPrompt === "string" && systemPrompt.length > 0
+      ? systemPrompt + (runtimeReminder ? "\n\n" + runtimeReminder : "")
+      : runtimeReminder;
+  if (combinedSystem.length > 0) {
+    anthropicBody.system = combinedSystem;
   }
 
   if (!fileEnvReady) {
@@ -519,9 +541,9 @@ export const onRequestPost: PagesHandler = async ({ request, env }) => {
   const result = await runToolLoop({
     initialBody: anthropicBody,
     apiKey,
-    models: selection.models,
+    models,
     usageBucket,
-    providerTag: `claude-smalltalk-${selection.models[0]}`,
+    providerTag: `claude-smalltalk-${models[0]}`,
     createdFiles,
     fileEnv,
     latestImageUrl,
@@ -548,7 +570,7 @@ export const onRequestPost: PagesHandler = async ({ request, env }) => {
     env,
     systemPrompt,
     messages,
-    providerTag: `claude-smalltalk-${selection.models[0]}`,
+    providerTag: `claude-smalltalk-${models[0]}`,
     usageBucket,
     createdFiles,
   });
