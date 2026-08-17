@@ -1,10 +1,12 @@
 import type {
   StApiMessage,
   StChatResponse,
+  StCreatedFile,
   StImageResponse,
   StResponseTextBlock,
   StSource,
 } from "./types";
+import { supabase } from "../../supabase";
 
 export type SmalltalkApiError = {
   status: number;
@@ -39,9 +41,22 @@ export async function callSmalltalkText(payload: {
   messages: StApiMessage[];
   systemPrompt: string;
 }): Promise<StChatResponse> {
+  // Access-Token mitschicken, damit der Server das `create_file`-Tool
+  // aktivieren kann (Upload in den Supabase-Bucket "chat-files" läuft
+  // über genau dieses Token, RLS erzwingt den eigenen Unterordner).
+  const {
+    data: { session },
+  } = await supabase.auth.getSession();
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+  };
+  if (session?.access_token) {
+    headers.authorization = `Bearer ${session.access_token}`;
+  }
+
   const res = await fetch("/api/smalltalk", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers,
     body: JSON.stringify(payload),
   });
   const json = await parseJsonSafe(res);
@@ -139,12 +154,23 @@ export function serializeAssistantContent(
 export function parseAssistantContent(content: string): {
   text: string;
   sources: StSource[];
+  files: StCreatedFile[];
 } {
-  const match = content.match(SOURCES_MARKER_RE);
-  if (!match) return { text: content, sources: [] };
+  // Reihenfolge: zuerst Files (sind am Ende hinzugefügt), dann Sources.
+  // Beide Marker sind unabhängig, deshalb erst File-Marker abschneiden
+  // und dann Source-Marker aus dem Restinhalt.
+  let remaining = content;
+  const files = parseFilesMarker(remaining);
+  if (files.marker) remaining = files.text;
+  const sourcesMatch = remaining.match(SOURCES_MARKER_RE);
+  if (!sourcesMatch) {
+    return { text: remaining, sources: [], files: files.files };
+  }
   try {
-    const parsed = JSON.parse(match[1]) as unknown;
-    if (!Array.isArray(parsed)) return { text: content, sources: [] };
+    const parsed = JSON.parse(sourcesMatch[1]) as unknown;
+    if (!Array.isArray(parsed)) {
+      return { text: remaining, sources: [], files: files.files };
+    }
     const sources: StSource[] = [];
     for (const item of parsed) {
       if (!item || typeof item !== "object") continue;
@@ -154,8 +180,111 @@ export function parseAssistantContent(content: string): {
       if (!url) continue;
       sources.push({ title: title || url, url });
     }
-    return { text: content.slice(0, match.index).trimEnd(), sources };
+    return {
+      text: remaining.slice(0, sourcesMatch.index).trimEnd(),
+      sources,
+      files: files.files,
+    };
   } catch {
-    return { text: content, sources: [] };
+    return { text: remaining, sources: [], files: files.files };
+  }
+}
+
+// --------------------- Datei-Marker (aus create_file-Tool) -----------------
+
+// Zweiter Serialisierungs-Marker, gleiches Prinzip wie SOURCES_MARKER,
+// nur für die vom Server erzeugten Downloads. Persistiert damit in
+// st_messages.content und überlebt Refresh/Deep-Links.
+const FILES_MARKER_PREFIX = "[[MYBRO_FILES:";
+const FILES_MARKER_SUFFIX = "]]";
+const FILES_MARKER_RE = /\n\n\[\[MYBRO_FILES:([\s\S]+?)\]\]\s*$/;
+
+const ALLOWED_FILE_TYPES: readonly StCreatedFile["file_type"][] = [
+  "csv",
+  "txt",
+  "pdf",
+  "docx",
+  "json",
+];
+
+/**
+ * Extrahiert die vom Server erzeugten Datei-Metadaten (`_files`).
+ * Dedupliziert nach URL (erste Nennung gewinnt).
+ */
+export function extractFiles(resp: StChatResponse): StCreatedFile[] {
+  const raw = Array.isArray(resp._files) ? resp._files : [];
+  const seen = new Set<string>();
+  const out: StCreatedFile[] = [];
+  for (const f of raw) {
+    if (!f || typeof f !== "object") continue;
+    const url = typeof f.url === "string" ? f.url.trim() : "";
+    const filename = typeof f.filename === "string" ? f.filename.trim() : "";
+    const fileType = f.file_type as StCreatedFile["file_type"];
+    const size = Number(f.size_bytes ?? 0);
+    if (!url || !filename || !ALLOWED_FILE_TYPES.includes(fileType)) continue;
+    if (seen.has(url)) continue;
+    seen.add(url);
+    out.push({
+      filename,
+      file_type: fileType,
+      url,
+      path: typeof f.path === "string" ? f.path : "",
+      size_bytes: Number.isFinite(size) ? Math.max(0, size) : 0,
+    });
+  }
+  return out;
+}
+
+/**
+ * Hängt eine Datei-Liste als Marker-Block an den Assistant-Text an –
+ * spiegelbildlich zu `serializeAssistantContent`. Wenn keine Dateien
+ * dabei sind, bleibt der Text unverändert.
+ */
+export function serializeFilesInto(
+  text: string,
+  files: readonly StCreatedFile[],
+): string {
+  if (files.length === 0) return text;
+  const json = JSON.stringify(files);
+  return `${text}\n\n${FILES_MARKER_PREFIX}${json}${FILES_MARKER_SUFFIX}`;
+}
+
+function parseFilesMarker(content: string): {
+  marker: boolean;
+  text: string;
+  files: StCreatedFile[];
+} {
+  const match = content.match(FILES_MARKER_RE);
+  if (!match) return { marker: false, text: content, files: [] };
+  try {
+    const parsed = JSON.parse(match[1]) as unknown;
+    if (!Array.isArray(parsed)) {
+      return { marker: false, text: content, files: [] };
+    }
+    const files: StCreatedFile[] = [];
+    for (const item of parsed) {
+      if (!item || typeof item !== "object") continue;
+      const rec = item as Record<string, unknown>;
+      const url = typeof rec.url === "string" ? rec.url.trim() : "";
+      const filename =
+        typeof rec.filename === "string" ? rec.filename.trim() : "";
+      const fileType = rec.file_type as StCreatedFile["file_type"];
+      const size = Number(rec.size_bytes ?? 0);
+      if (!url || !filename || !ALLOWED_FILE_TYPES.includes(fileType)) continue;
+      files.push({
+        filename,
+        file_type: fileType,
+        url,
+        path: typeof rec.path === "string" ? rec.path : "",
+        size_bytes: Number.isFinite(size) ? Math.max(0, size) : 0,
+      });
+    }
+    return {
+      marker: true,
+      text: content.slice(0, match.index).trimEnd(),
+      files,
+    };
+  } catch {
+    return { marker: false, text: content, files: [] };
   }
 }

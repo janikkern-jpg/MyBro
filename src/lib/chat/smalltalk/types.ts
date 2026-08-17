@@ -68,12 +68,25 @@ export type StChatResponse = {
   content: Array<StResponseTextBlock | { type: string; text?: string }>;
   model?: string;
   stop_reason?: string | null;
+  // Vom Smalltalk-Endpoint gefüllt, wenn Claude im Tool-Loop das
+  // `create_file`-Tool aufgerufen hat. Der Client rendert diese Karten
+  // unter der Nachricht (nicht als Anhang der User-Nachricht!).
+  _files?: StCreatedFile[];
 };
 
 // Kompakte, in `content` persistierbare Quellenangabe.
 export type StSource = {
   title: string;
   url: string;
+};
+
+// Vom Server erzeugte Datei-Metadaten (siehe netlify/functions/_shared/createFile.ts).
+export type StCreatedFile = {
+  filename: string;
+  file_type: "csv" | "txt" | "pdf" | "docx" | "json";
+  url: string;
+  path: string;
+  size_bytes: number;
 };
 
 export type StImageResponse = {

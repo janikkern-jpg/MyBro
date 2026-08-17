@@ -31,9 +31,11 @@ import {
   callSmalltalkImage,
   callSmalltalkText,
   extractAssistantText,
+  extractFiles,
   extractSources,
   parseAssistantContent,
   serializeAssistantContent,
+  serializeFilesInto,
 } from "../lib/chat/smalltalk/api";
 import { detectImageIntent, extractImagePrompt } from "../lib/chat/smalltalk/intent";
 import { buildSmalltalkSystemPrompt } from "../lib/chat/smalltalk/systemPrompt";
@@ -392,12 +394,18 @@ function SmalltalkChat() {
         }
 
         const assistantText = extractAssistantText(response);
-        if (assistantText) {
+        if (assistantText || (response._files && response._files.length > 0)) {
           const sources = extractSources(response);
+          const files = extractFiles(response);
+          const withSources = serializeAssistantContent(
+            assistantText,
+            sources,
+          );
+          const finalContent = serializeFilesInto(withSources, files);
           const assistantRow = await insertMessage({
             conversationId: conv.id,
             role: "assistant",
-            content: serializeAssistantContent(assistantText, sources),
+            content: finalContent,
           });
           setMessages((prev) => [...prev, assistantRow]);
         }
@@ -524,14 +532,16 @@ function SmalltalkBubble({
   imageUrl: string | null;
 }) {
   const isUser = role === "user";
-  // Bei Assistant-Nachrichten kann ein serialisierter Quellen-Block am
-  // Ende hängen (aus web_search-Zitationen). Wir spalten ihn ab und
-  // rendern die Quellen als kleine, klickbare Link-Liste unter dem Text.
+  // Bei Assistant-Nachrichten können zwei Marker am Ende hängen:
+  // (a) serialisierte web_search-Quellen, (b) vom create_file-Tool
+  // erzeugte Datei-Downloads. Wir spalten beide ab und rendern sie als
+  // eigene Blöcke unter dem Text.
   const parsed = !isUser
     ? parseAssistantContent(content)
-    : { text: content, sources: [] as const };
+    : { text: content, sources: [] as const, files: [] as const };
   const displayText = parsed.text;
   const sources = parsed.sources;
+  const files = parsed.files;
   return (
     <div className={isUser ? "flex justify-end" : "flex justify-start"}>
       <div
@@ -551,6 +561,13 @@ function SmalltalkBubble({
           ) : (
             <MarkdownContent text={displayText} />
           )
+        ) : null}
+        {files.length > 0 ? (
+          <div className="mt-2 space-y-1.5">
+            {files.map((f) => (
+              <FileCard key={f.url} file={f} />
+            ))}
+          </div>
         ) : null}
         {sources.length > 0 ? (
           <div className="mt-2 border-t border-border/60 pt-2 text-xs text-text-muted">
@@ -575,6 +592,59 @@ function SmalltalkBubble({
     </div>
   );
 }
+
+// Kompakte Karte für einen vom create_file-Tool erzeugten Download.
+// Optik: Datei-Icon, Dateiname, Typ + Größe, klar sichtbarer
+// "Herunterladen"-Button (nicht nur ein Text-Link).
+function FileCard({
+  file,
+}: {
+  file: {
+    filename: string;
+    file_type: "csv" | "txt" | "pdf" | "docx" | "json";
+    url: string;
+    size_bytes: number;
+  };
+}) {
+  const typeLabel = file.file_type.toUpperCase();
+  const sizeLabel = formatBytes(file.size_bytes);
+  return (
+    <a
+      href={file.url}
+      target="_blank"
+      rel="noopener noreferrer"
+      download={file.filename}
+      className="flex items-center gap-3 rounded-xl border border-border bg-bg px-3 py-2 no-underline transition-colors hover:border-accent/60 hover:bg-surface"
+    >
+      <div
+        aria-hidden="true"
+        className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-accent/15 text-[10px] font-bold uppercase tracking-wide text-accent"
+      >
+        {typeLabel}
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="truncate text-sm font-medium text-text">
+          {file.filename}
+        </div>
+        <div className="truncate text-xs text-text-muted">
+          {typeLabel}
+          {sizeLabel ? ` · ${sizeLabel}` : ""}
+        </div>
+      </div>
+      <span className="shrink-0 rounded-md border border-accent/40 bg-accent/10 px-2.5 py-1 text-xs font-semibold text-accent">
+        Herunterladen
+      </span>
+    </a>
+  );
+}
+
+function formatBytes(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return "";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 
 function AddToProjectDialog({
   userId,

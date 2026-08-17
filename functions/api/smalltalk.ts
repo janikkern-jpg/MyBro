@@ -11,16 +11,16 @@ import {
   usageFromAnthropicJson,
   type UsageRecord,
 } from "../_shared/pricing";
+import {
+  CREATE_FILE_TOOL,
+  createFileFromToolInput,
+  type CreatedFile,
+} from "../_shared/createFile";
 import type { Env, PagesHandler } from "../_shared/pages";
 
 // Smalltalk-Chat-Endpoint (Cloudflare Pages Functions).
-// Eigenständiger Zweig (kein MyBro-Kontext) mit:
-// - gemeinsamem Modell-Routing (haiku/sonnet/opus je nach Komplexität)
-// - OpenAI-Fallback (gpt-5.4) bei dauerhaften 5xx/Netzwerk-Fehlern
-// - Anthropic-eigenem Web-Search-Tool (server-side), damit die KI bei
-//   aktuellen/sich ändernden Fragen (Preise, Termine, News, Öffnungs-
-//   zeiten) selbständig recherchieren kann. Zusätzliche Kosten pro Such-
-//   anfrage werden separat in usage_log geloggt.
+// Analog zur Netlify-Variante: Web-Search-Server-Tool + client-seitiges
+// create_file-Tool im Loop. Siehe netlify/functions/smalltalk.ts.
 
 type SmalltalkRequestBody = {
   messages: AnthropicMessage[];
@@ -28,9 +28,8 @@ type SmalltalkRequestBody = {
 };
 
 const MAX_TOKENS = 4096;
+const MAX_TOOL_ITERATIONS = 5;
 
-// max_uses begrenzt die Anzahl Websuchen pro Anfrage – verhindert, dass
-// ein einzelner Turn versehentlich Dutzende Suchen auslöst.
 const WEB_SEARCH_TOOL = {
   type: "web_search_20250305",
   name: "web_search",
@@ -51,9 +50,6 @@ function errorResponse(status: number, message: string): Response {
   return jsonResponse(status, { error: message });
 }
 
-// Loggt in Cloudflare-Function-Logs, ob Claude das Web-Search-Tool
-// tatsächlich aufgerufen hat. Nützlich zum Debuggen, wenn erwartete
-// Live-Recherchen ausbleiben (z. B. wegen Prompt, Modell oder Auslastung).
 function logWebSearchTelemetry(
   providerTag: string,
   parsed: Record<string, unknown>,
@@ -86,6 +82,147 @@ function logWebSearchTelemetry(
   );
 }
 
+// -------------------- Tool-Loop-Helfer ---------------------------------
+
+type ContentBlockJson = Record<string, unknown>;
+
+function extractClientToolUses(
+  parsed: Record<string, unknown>,
+): Array<{ id: string; name: string; input: unknown }> {
+  const content = Array.isArray(parsed.content)
+    ? (parsed.content as ContentBlockJson[])
+    : [];
+  const uses: Array<{ id: string; name: string; input: unknown }> = [];
+  for (const b of content) {
+    if (b?.type !== "tool_use") continue;
+    const id = typeof b.id === "string" ? b.id : "";
+    const name = typeof b.name === "string" ? b.name : "";
+    if (id && name === "create_file") {
+      uses.push({ id, name, input: b.input });
+    }
+  }
+  return uses;
+}
+
+async function runToolLoop(opts: {
+  initialBody: Record<string, unknown>;
+  apiKey: string;
+  models: readonly string[];
+  usageBucket: UsageRecord[];
+  providerTag: string;
+  createdFiles: CreatedFile[];
+  fileEnv: {
+    userId: string;
+    accessToken: string;
+    supabaseUrl: string;
+    supabaseAnonKey: string;
+  } | null;
+}): Promise<FetchOutcome> {
+  const messages = [
+    ...((opts.initialBody.messages as AnthropicMessage[]) ?? []),
+  ];
+  let lastOutcome: FetchOutcome | null = null;
+
+  for (let iter = 0; iter < MAX_TOOL_ITERATIONS; iter++) {
+    const body = { ...opts.initialBody, messages };
+    const outcome = await callAnthropicWithFallback(
+      body,
+      opts.apiKey,
+      opts.models,
+    );
+    lastOutcome = outcome;
+
+    if (outcome.kind !== "response" || !outcome.response.ok) {
+      return outcome;
+    }
+
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(outcome.rawText) as Record<string, unknown>;
+    } catch {
+      return outcome;
+    }
+
+    const mainUsage = usageFromAnthropicJson(
+      parsed,
+      opts.models[0] ?? "unknown",
+    );
+    if (mainUsage) opts.usageBucket.push(mainUsage);
+    const webSearchUsage = usageForAnthropicWebSearch(parsed);
+    if (webSearchUsage) opts.usageBucket.push(webSearchUsage);
+    logWebSearchTelemetry(opts.providerTag, parsed);
+
+    const stopReason =
+      typeof parsed.stop_reason === "string" ? parsed.stop_reason : "";
+    const toolUses = extractClientToolUses(parsed);
+
+    if (stopReason !== "tool_use" || toolUses.length === 0) {
+      return outcome;
+    }
+
+    messages.push({
+      role: "assistant",
+      content: parsed.content as unknown,
+    });
+
+    const toolResultBlocks: ContentBlockJson[] = [];
+    for (const use of toolUses) {
+      if (!opts.fileEnv) {
+        toolResultBlocks.push({
+          type: "tool_result",
+          tool_use_id: use.id,
+          is_error: true,
+          content:
+            "Dateidownload nicht verfügbar: der Nutzer ist nicht authentifiziert oder der Server hat keine Supabase-Konfiguration.",
+        });
+        continue;
+      }
+      try {
+        const file = await createFileFromToolInput(use.input, opts.fileEnv);
+        opts.createdFiles.push(file);
+        toolResultBlocks.push({
+          type: "tool_result",
+          tool_use_id: use.id,
+          content: JSON.stringify({
+            ok: true,
+            filename: file.filename,
+            file_type: file.file_type,
+            url: file.url,
+            size_bytes: file.size_bytes,
+            note:
+              "Datei wurde erzeugt und im Chat als Download-Karte angezeigt. Erwähne den Dateinamen kurz, aber wiederhole den Inhalt NICHT im Text.",
+          }),
+        });
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : "Unbekannter Fehler.";
+        console.error("[smalltalk] create_file fehlgeschlagen:", message);
+        toolResultBlocks.push({
+          type: "tool_result",
+          tool_use_id: use.id,
+          is_error: true,
+          content: `Datei konnte nicht erzeugt werden: ${message}`,
+        });
+      }
+    }
+
+    messages.push({
+      role: "user",
+      content: toolResultBlocks as unknown,
+    });
+  }
+
+  console.warn(
+    `[smalltalk] Tool-Loop hat MAX_TOOL_ITERATIONS (${MAX_TOOL_ITERATIONS}) erreicht.`,
+  );
+  return (
+    lastOutcome ?? {
+      kind: "network-error",
+      error: new Error("Tool-Loop ohne Antwort."),
+    }
+  );
+}
+
 async function respondFromOutcome(
   outcome: FetchOutcome,
   ctx: {
@@ -93,20 +230,19 @@ async function respondFromOutcome(
     systemPrompt: string | undefined;
     messages: AnthropicMessage[];
     providerTag: string;
-    primaryModel: string;
     usageBucket: UsageRecord[];
+    createdFiles: CreatedFile[];
   },
 ): Promise<Response> {
   if (outcome.kind === "response" && outcome.response.ok) {
     try {
       const parsed = JSON.parse(outcome.rawText) as Record<string, unknown>;
-      const mainUsage = usageFromAnthropicJson(parsed, ctx.primaryModel);
-      if (mainUsage) ctx.usageBucket.push(mainUsage);
-      const webSearchUsage = usageForAnthropicWebSearch(parsed);
-      if (webSearchUsage) ctx.usageBucket.push(webSearchUsage);
-      logWebSearchTelemetry(ctx.providerTag, parsed);
       console.log(`[provider=${ctx.providerTag}] Antwort erfolgreich.`);
-      return jsonResponse(200, { ...parsed, _usage: ctx.usageBucket });
+      return jsonResponse(200, {
+        ...parsed,
+        _usage: ctx.usageBucket,
+        _files: ctx.createdFiles,
+      });
     } catch {
       console.error("Anthropic-Response konnte nicht als JSON geparst werden.");
     }
@@ -133,6 +269,7 @@ async function respondFromOutcome(
         return jsonResponse(200, {
           ...openAIOutcome.anthropicShaped,
           _usage: ctx.usageBucket,
+          _files: ctx.createdFiles,
         });
       }
 
@@ -181,6 +318,27 @@ async function respondFromOutcome(
   });
 }
 
+function readBearer(req: Request): string {
+  const raw =
+    req.headers.get("authorization") || req.headers.get("Authorization") || "";
+  const m = raw.match(/^Bearer\s+(.+)$/i);
+  return m ? m[1].trim() : "";
+}
+
+function parseJwtSubject(token: string): string {
+  if (!token) return "";
+  const parts = token.split(".");
+  if (parts.length !== 3) return "";
+  try {
+    const payload = JSON.parse(
+      atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")),
+    ) as { sub?: unknown };
+    return typeof payload.sub === "string" ? payload.sub : "";
+  } catch {
+    return "";
+  }
+}
+
 export const onRequestPost: PagesHandler = async ({ request, env }) => {
   const apiKey = env.ANTHROPIC_API_KEY;
   if (!apiKey) {
@@ -216,37 +374,57 @@ export const onRequestPost: PagesHandler = async ({ request, env }) => {
   const usageBucket: UsageRecord[] = [];
   if (selection.classifierUsage) usageBucket.push(selection.classifierUsage);
 
-  // Kill-Switch: SMALLTALK_DISABLE_WEB_SEARCH="1" deaktiviert das
-  // Web-Search-Tool komplett (Debug-Hilfe zum Isolieren von 401/tool-
-  // Zugriffsfehlern gegenüber generellen Key-Problemen).
+  const accessToken = readBearer(request);
+  const userId = parseJwtSubject(accessToken);
+  const supabaseUrl = env.SUPABASE_URL || "";
+  const supabaseAnonKey = env.SUPABASE_ANON_KEY || "";
+  const fileEnvReady = Boolean(
+    accessToken && userId && supabaseUrl && supabaseAnonKey,
+  );
+  const fileEnv = fileEnvReady
+    ? { userId, accessToken, supabaseUrl, supabaseAnonKey }
+    : null;
+
   const webSearchDisabled = env.SMALLTALK_DISABLE_WEB_SEARCH === "1";
+
+  const tools: unknown[] = [];
+  if (!webSearchDisabled) tools.push(WEB_SEARCH_TOOL);
+  if (fileEnvReady) tools.push(CREATE_FILE_TOOL);
+
   const anthropicBody: Record<string, unknown> = {
     max_tokens: MAX_TOKENS,
     messages,
   };
-  if (!webSearchDisabled) {
-    anthropicBody.tools = [WEB_SEARCH_TOOL];
-  } else {
-    console.warn(
-      "[smalltalk] SMALLTALK_DISABLE_WEB_SEARCH=1 – web_search-Tool deaktiviert.",
-    );
-  }
+  if (tools.length > 0) anthropicBody.tools = tools;
   if (typeof systemPrompt === "string" && systemPrompt.length > 0) {
     anthropicBody.system = systemPrompt;
   }
 
-  const outcome = await callAnthropicWithFallback(
-    anthropicBody,
+  if (!fileEnvReady) {
+    console.warn(
+      "[smalltalk] create_file-Tool nicht aktiv:" +
+        ` token=${accessToken ? "yes" : "no"}, userId=${userId ? "yes" : "no"},` +
+        ` SUPABASE_URL=${supabaseUrl ? "yes" : "no"}, SUPABASE_ANON_KEY=${supabaseAnonKey ? "yes" : "no"}.`,
+    );
+  }
+
+  const createdFiles: CreatedFile[] = [];
+  const outcome = await runToolLoop({
+    initialBody: anthropicBody,
     apiKey,
-    selection.models,
-  );
+    models: selection.models,
+    usageBucket,
+    providerTag: `claude-smalltalk-${selection.models[0]}`,
+    createdFiles,
+    fileEnv,
+  });
 
   return respondFromOutcome(outcome, {
     env,
     systemPrompt,
     messages,
     providerTag: `claude-smalltalk-${selection.models[0]}`,
-    primaryModel: selection.models[0],
     usageBucket,
+    createdFiles,
   });
 };

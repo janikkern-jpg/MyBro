@@ -31,6 +31,25 @@ function buildWebSearchGuidance(): string {
   ].join("\n");
 }
 
+// Hinweis für das zweite serverseitige Tool: `create_file`. Wichtig ist
+// vor allem, dass das Modell den Inhalt NICHT zusätzlich in den Chat
+// schreibt, sonst hätte der Nutzer alles doppelt (einmal als Text,
+// einmal in der Datei).
+function buildCreateFileGuidance(): string {
+  return [
+    "WERKZEUG: Dir steht das Tool `create_file` zur Verfügung. Nutze es, wenn der Nutzer explizit um eine Datei, einen Export oder ein Dokument bittet – z. B. „als CSV\", „mach mir daraus eine Excel-Liste\", „exportiere das als PDF\", „gib mir das als Word-Datei\", „speicher das als .txt\", „gib mir die Daten als JSON\".",
+    "",
+    "Regeln:",
+    "- Erlaubte `file_type`-Werte: `csv`, `txt`, `pdf`, `docx`, `json`. Bei „Excel-Liste\" nimm `csv` (öffnet sich in Excel).",
+    "- Wähle einen kurzen, sprechenden Dateinamen ohne Pfad, mit passender Endung (z. B. `einkaufsliste.csv`, `bewerbung.pdf`).",
+    "- CSV: erste Zeile = Kopfzeile, Felder mit Komma trennen, Werte mit `,`/`\"`/Zeilenumbruch in doppelten Anführungszeichen quoten.",
+    "- JSON: gültiges, formatiertes JSON (nicht in ```-Blöcke einwickeln).",
+    "- PDF/DOCX/TXT: Klartext-Content mit Absätzen und einfachen Listen (`- ` / `* ` / `1. `). Keine komplexen Layouts, Bilder oder Formeln.",
+    "- Wenn die Datei erzeugt wurde, WIEDERHOLE ihren Inhalt NICHT im Chat. Sag stattdessen kurz, dass die Datei bereitsteht (z. B. „Ich habe dir `einkaufsliste.csv` erstellt.\") – die UI zeigt automatisch eine Download-Karte.",
+    "- Nur benutzen, wenn der Nutzer klar eine Datei will. Bei „schreib mir einen Text über…\" bleibt es Chat-Text.",
+  ].join("\n");
+}
+
 /**
  * Baut den Smalltalk-System-Prompt aus den ausgefüllten Prinzipien-Zeilen.
  * Leere Felder (weder title noch body) werden ignoriert. Sind ALLE Zeilen
@@ -44,7 +63,7 @@ export function buildSmalltalkSystemPrompt(
     .filter((p) => (p.title ?? "").trim() || (p.body ?? "").trim());
 
   if (filled.length === 0) {
-    return `${NEUTRAL_DEFAULT}\n\n${GUIDANCE}\n\n${buildWebSearchGuidance()}`;
+    return `${NEUTRAL_DEFAULT}\n\n${GUIDANCE}\n\n${buildWebSearchGuidance()}\n\n${buildCreateFileGuidance()}`;
   }
 
   const lines = filled.map((p, i) => {
@@ -61,5 +80,7 @@ export function buildSmalltalkSystemPrompt(
     GUIDANCE,
     "",
     buildWebSearchGuidance(),
+    "",
+    buildCreateFileGuidance(),
   ].join("\n");
 }
