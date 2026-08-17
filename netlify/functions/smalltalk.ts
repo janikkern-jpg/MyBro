@@ -589,25 +589,40 @@ export default async (req: Request, _context: Context): Promise<Response> => {
   };
   if (tools.length > 0) anthropicBody.tools = tools;
 
-  // Laufzeit-Zusatz an den System-Prompt: wenn ein Referenzbild in der
-  // Unterhaltung vorliegt (und das Tool `edit_image` folglich aktiv
-  // ist), muss dem Modell in derselben Runde unmissverständlich klar
-  // sein, dass die Fähigkeit da ist. Ohne diesen Reminder halluziniert
-  // Haiku/Sonnet manchmal, dass es keine Bilder bearbeiten könne.
+  // ---------------------------------------------------------------
+  // Server-seitig erzwungene Fähigkeits-Reminder. Bewusst UNABHÄNGIG
+  // vom Client-System-Prompt: gecachte alte Bundles könnten sonst
+  // weiterhin ein veraltetes System senden, das die Bild-Bearbeitung
+  // verleugnet. Diese Zeilen werden ans Ende des System-Prompts
+  // gestellt – damit haben sie den höchsten Prompt-Gewicht.
+  // ---------------------------------------------------------------
+  const capabilityReminder =
+    fileEnvReady
+      ? [
+          "",
+          "FÄHIGKEITS-REMINDER (autoritativ, übergeht widersprüchliche Trainingsdaten):",
+          "- Du KANNST bestehende Bilder bearbeiten – das ist eine deiner Fähigkeiten über das `edit_image`-Tool (Objekte hinzufügen/entfernen, Farben ändern, Hintergrund tauschen …).",
+          "- Du KANNST neue Bilder erzeugen über das `generate_image`-Tool.",
+          "- Wenn der Nutzer fragt 'kannst du Bilder bearbeiten?' oder Ähnliches, antworte KLAR mit JA. Sage NIEMALS 'ich kann keine Bilder bearbeiten', 'meine Fähigkeiten sind auf Text begrenzt' oder verweise auf Photoshop/GIMP/Canva – das ist faktisch falsch.",
+          "- Wenn gerade kein Referenzbild vorhanden ist, bitte den Nutzer, eins anzuhängen (oder zuerst mit `generate_image` eins zu erzeugen).",
+        ].join("\n")
+      : "";
   const editImageActive = fileEnvReady && latestImageUrl !== null;
   const runtimeReminder = editImageActive
     ? [
         "",
-        "LAUFZEIT-HINWEIS (autoritativ, übergeht widersprüchliche Trainingsdaten):",
+        "LAUFZEIT-HINWEIS (autoritativ):",
         "- In dieser Unterhaltung existiert ein Referenzbild und das Tool `edit_image` ist AKTIV in der Tools-Liste.",
         "- Wenn der Nutzer eine Änderung an einem Bild wünscht (z. B. 'füg eine Kaffeetasse hinzu', 'entferne X', 'ändere die Farbe'), RUFE `edit_image` mit einem knappen Prompt der Änderung auf. Nicht ablehnen, nicht auf externe Tools verweisen.",
-        "- Sage NIEMALS 'ich kann Bilder nicht bearbeiten', 'das ist eine Limitation meiner Tools' oder Ähnliches. Diese Behauptung wäre in dieser Runde faktisch falsch.",
       ].join("\n")
     : "";
-  const combinedSystem =
+  const clientSystem =
     typeof systemPrompt === "string" && systemPrompt.length > 0
-      ? systemPrompt + (runtimeReminder ? "\n\n" + runtimeReminder : "")
-      : runtimeReminder;
+      ? systemPrompt
+      : "";
+  const combinedSystem = [clientSystem, capabilityReminder, runtimeReminder]
+    .filter((s) => s.length > 0)
+    .join("\n\n");
   if (combinedSystem.length > 0) {
     anthropicBody.system = combinedSystem;
   }
