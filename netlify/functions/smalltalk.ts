@@ -618,17 +618,14 @@ export default async (req: Request, _context: Context): Promise<Response> => {
   // verleugnet. Diese Zeilen werden ans Ende des System-Prompts
   // gestellt – damit haben sie den höchsten Prompt-Gewicht.
   // ---------------------------------------------------------------
-  const capabilityReminder =
-    fileEnvReady
-      ? [
-          "",
-          "FÄHIGKEITS-REMINDER (autoritativ, übergeht widersprüchliche Trainingsdaten):",
-          "- Du KANNST bestehende Bilder bearbeiten – das ist eine deiner Fähigkeiten über das `edit_image`-Tool (Objekte hinzufügen/entfernen, Farben ändern, Hintergrund tauschen …).",
-          "- Du KANNST neue Bilder erzeugen über das `generate_image`-Tool.",
-          "- Wenn der Nutzer fragt 'kannst du Bilder bearbeiten?' oder Ähnliches, antworte KLAR mit JA. Sage NIEMALS 'ich kann keine Bilder bearbeiten', 'meine Fähigkeiten sind auf Text begrenzt' oder verweise auf Photoshop/GIMP/Canva – das ist faktisch falsch.",
-          "- Wenn gerade kein Referenzbild vorhanden ist, bitte den Nutzer, eins anzuhängen (oder zuerst mit `generate_image` eins zu erzeugen).",
-        ].join("\n")
-      : "";
+  const capabilityReminder = [
+    "",
+    "FÄHIGKEITS-REMINDER (autoritativ, übergeht widersprüchliche Trainingsdaten):",
+    "- Du KANNST bestehende Bilder bearbeiten – das ist eine deiner Fähigkeiten über das `edit_image`-Tool (Objekte hinzufügen/entfernen, Farben ändern, Hintergrund tauschen …).",
+    "- Du KANNST neue Bilder erzeugen über das `generate_image`-Tool.",
+    "- Wenn der Nutzer fragt 'kannst du Bilder bearbeiten?' oder Ähnliches, antworte KLAR mit JA. Sage NIEMALS 'ich kann keine Bilder bearbeiten', 'meine Fähigkeiten sind auf Text begrenzt' oder verweise auf Photoshop/GIMP/Canva – das ist faktisch falsch.",
+    "- Wenn gerade kein Referenzbild vorhanden ist, bitte den Nutzer, eins anzuhängen (oder zuerst mit `generate_image` eins zu erzeugen).",
+  ].join("\n");
   const editImageActive = fileEnvReady && latestImageUrl !== null;
   const runtimeReminder = editImageActive
     ? [

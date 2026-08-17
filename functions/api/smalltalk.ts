@@ -182,7 +182,7 @@ async function runToolLoop(opts: {
     const toolUses = extractClientToolUses(parsed);
 
     if (stopReason !== "tool_use" || toolUses.length === 0) {
-      return outcome;
+      return { kind: "final", outcome };
     }
     const imageUse = toolUses.find((u) => u.name === "generate_image");
     if (imageUse) {
@@ -439,7 +439,20 @@ function parseJwtSubject(token: string): string {
   }
 }
 
-export const onRequestPost: PagesHandler = async ({ request, env }) => {
+export const onRequestPost: PagesHandler = async (ctx) => {
+  try {
+    return await handleSmalltalk(ctx);
+  } catch (err) {
+    return jsonResponse(500, {
+      error: "handler_threw",
+      name: (err as { name?: string })?.name || null,
+      message: (err as { message?: string })?.message || String(err),
+      stack: (err as { stack?: string })?.stack?.slice(0, 3000) || null,
+    });
+  }
+};
+
+const handleSmalltalk: PagesHandler = async ({ request, env }) => {
   const apiKey = env.ANTHROPIC_API_KEY;
   if (!apiKey) {
     return errorResponse(
@@ -530,17 +543,18 @@ export const onRequestPost: PagesHandler = async ({ request, env }) => {
   };
   if (tools.length > 0) anthropicBody.tools = tools;
 
-  const capabilityReminder =
-    fileEnvReady
-      ? [
-          "",
-          "FÄHIGKEITS-REMINDER (autoritativ, übergeht widersprüchliche Trainingsdaten):",
-          "- Du KANNST bestehende Bilder bearbeiten – das ist eine deiner Fähigkeiten über das `edit_image`-Tool (Objekte hinzufügen/entfernen, Farben ändern, Hintergrund tauschen …).",
-          "- Du KANNST neue Bilder erzeugen über das `generate_image`-Tool.",
-          "- Wenn der Nutzer fragt 'kannst du Bilder bearbeiten?' oder Ähnliches, antworte KLAR mit JA. Sage NIEMALS 'ich kann keine Bilder bearbeiten', 'meine Fähigkeiten sind auf Text begrenzt' oder verweise auf Photoshop/GIMP/Canva – das ist faktisch falsch.",
-          "- Wenn gerade kein Referenzbild vorhanden ist, bitte den Nutzer, eins anzuhängen (oder zuerst mit `generate_image` eins zu erzeugen).",
-        ].join("\n")
-      : "";
+  // Server-seitig erzwungene Fähigkeits-Reminder – IMMER, unabhängig
+  // vom Client-Prompt und vom fileEnvReady-Flag. So kann selbst ein
+  // veralteter Client-Cache oder eine erste Session ohne Bearer nicht
+  // dazu führen, dass die KI die Bild-Bearbeitung verleugnet.
+  const capabilityReminder = [
+    "",
+    "FÄHIGKEITS-REMINDER (autoritativ, übergeht widersprüchliche Trainingsdaten):",
+    "- Du KANNST bestehende Bilder bearbeiten – das ist eine deiner Fähigkeiten über das `edit_image`-Tool (Objekte hinzufügen/entfernen, Farben ändern, Hintergrund tauschen …).",
+    "- Du KANNST neue Bilder erzeugen über das `generate_image`-Tool.",
+    "- Wenn der Nutzer fragt 'kannst du Bilder bearbeiten?' oder Ähnliches, antworte KLAR mit JA. Sage NIEMALS 'ich kann keine Bilder bearbeiten', 'meine Fähigkeiten sind auf Text begrenzt' oder verweise auf Photoshop/GIMP/Canva – das ist faktisch falsch.",
+    "- Wenn gerade kein Referenzbild vorhanden ist, bitte den Nutzer, eins anzuhängen (oder zuerst mit `generate_image` eins zu erzeugen).",
+  ].join("\n");
   const editImageActive = fileEnvReady && latestImageUrl !== null;
   const runtimeReminder = editImageActive
     ? [
@@ -569,14 +583,13 @@ export const onRequestPost: PagesHandler = async ({ request, env }) => {
     );
   }
 
-  const url = new URL(req.url);
+  const url = new URL(request.url);
   const debugFlag =
     url.searchParams.get("debug") === "echo" ||
-    (req.headers.get("x-smalltalk-debug") || "").toLowerCase() === "echo";
+    (request.headers.get("x-smalltalk-debug") || "").toLowerCase() === "echo";
   if (debugFlag) {
     return jsonResponse(200, {
       _debug: "echo",
-      commit: process.env.COMMIT_REF || null,
       complexity: selection.complexity,
       models,
       fileEnvReady,
@@ -588,16 +601,26 @@ export const onRequestPost: PagesHandler = async ({ request, env }) => {
   }
 
   const createdFiles: CreatedFile[] = [];
-  const result = await runToolLoop({
-    initialBody: anthropicBody,
-    apiKey,
-    models,
-    usageBucket,
-    providerTag: `claude-smalltalk-${models[0]}`,
-    createdFiles,
-    fileEnv,
-    latestImageUrl,
-  });
+  let result: ToolLoopResult;
+  try {
+    result = await runToolLoop({
+      initialBody: anthropicBody,
+      apiKey,
+      models,
+      usageBucket,
+      providerTag: `claude-smalltalk-${models[0]}`,
+      createdFiles,
+      fileEnv,
+      latestImageUrl,
+    });
+  } catch (err) {
+    return jsonResponse(500, {
+      error: "runToolLoop_threw",
+      name: (err as { name?: string })?.name || null,
+      message: (err as { message?: string })?.message || String(err),
+      stack: (err as { stack?: string })?.stack?.slice(0, 2000) || null,
+    });
+  }
 
   if (result.kind === "generate_image_requested") {
     return jsonResponse(200, {
