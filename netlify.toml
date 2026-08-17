@@ -17,6 +17,12 @@
 [functions."generate-image"]
   timeout = 26
 
+# `edit_image` hat zusätzlich noch einen Download-Schritt für das
+# Referenzbild – gleicher Timeout, damit beide Endpoints konsistent
+# das Sync-Maximum ausschöpfen.
+[functions."edit-image"]
+  timeout = 26
+
 # Kurzer Alias für den Chat-Endpunkt.
 [[redirects]]
   from = "/api/chat"

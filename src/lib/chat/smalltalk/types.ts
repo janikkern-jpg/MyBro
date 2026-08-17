@@ -81,9 +81,11 @@ export type StChatResponse = {
   // das Tool `generate_image` verlangt hat, antwortet der Server NICHT
   // mit fertigem Content, sondern signalisiert dem Frontend, dass jetzt
   // der zweite Endpoint (`/api/generate-image`) angestoßen werden soll.
-  status?: "generating_image";
+  // Analog `editing_image` → `/api/edit-image` mit `sourceImageUrl`.
+  status?: "generating_image" | "editing_image";
   imagePrompt?: string;
   imageSize?: string | null;
+  sourceImageUrl?: string;
 };
 
 // Kompakte, in `content` persistierbare Quellenangabe.

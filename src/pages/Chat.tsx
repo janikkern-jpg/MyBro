@@ -28,6 +28,7 @@ import {
   type ToolUseBlock,
 } from "../lib/chat/types";
 import {
+  callEditImage,
   callGenerateImage,
   callSmalltalkText,
   extractAssistantText,
@@ -210,12 +211,14 @@ function SmalltalkChat() {
   const [input, setInput] = useState("");
   const [isSending, setIsSending] = useState(false);
   // Nicht-null, sobald der Smalltalk-Endpoint {status:"generating_image"}
-  // geliefert hat und wir auf das Ergebnis von /api/generate-image warten.
-  // Ersetzt in dieser Zeit die generische Tippanzeige durch einen
-  // dedizierten "Bild wird generiert…"-Loader.
-  const [pendingImage, setPendingImage] = useState<{ prompt: string } | null>(
-    null,
-  );
+  // oder {status:"editing_image"} geliefert hat und wir auf das Ergebnis
+  // von /api/generate-image bzw. /api/edit-image warten. Ersetzt in
+  // dieser Zeit die generische Tippanzeige durch einen dedizierten
+  // "Bild wird generiert…"- bzw. "Bild wird bearbeitet…"-Loader.
+  const [pendingImage, setPendingImage] = useState<{
+    prompt: string;
+    mode: "generate" | "edit";
+  } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
   const [projectDialogOpen, setProjectDialogOpen] = useState(false);
@@ -358,41 +361,52 @@ function SmalltalkChat() {
           { role: "user", content: currentUserContent },
         ];
 
-        // 4) LLM-Aufruf und Storage-Upload parallel starten.
-        const uploadPromise: Promise<{ path: string; publicUrl: string } | null> =
-          image ? uploadChatImage(userId, image.blob) : Promise.resolve(null);
-        const [response, uploaded] = await Promise.all([
-          callSmalltalkText({ messages: apiMessages, systemPrompt }),
-          uploadPromise,
-        ]);
-        void logUsageFromResponse(userId, response);
-
-        // 5) Falls Upload erfolgreich: image_url in die eben angelegte
-        //    User-Row nachtragen.
-        if (uploaded) {
-          const { error: updErr } = await supabase
-            .from("st_messages")
-            .update({ image_url: uploaded.publicUrl })
-            .eq("id", userRow.id);
-          if (updErr) {
-            console.warn("[smalltalk] image_url update failed", updErr);
-          } else {
-            setMessages((prev) =>
-              prev.map((m) =>
-                m.id === userRow.id
-                  ? { ...m, image_url: uploaded.publicUrl }
-                  : m,
-              ),
-            );
+        // 4) Wenn ein Bild angehängt wurde: zuerst hochladen, damit wir
+        //    die public URL als `latestImageUrl` an den Smalltalk-
+        //    Endpoint mitschicken können (dann kann Claude das gerade
+        //    angehängte Bild direkt mit `edit_image` bearbeiten). Ohne
+        //    Anhang leiten wir die zuletzt bekannte Bild-URL aus dem
+        //    bisherigen Verlauf ab.
+        let uploaded: { path: string; publicUrl: string } | null = null;
+        if (image) {
+          uploaded = await uploadChatImage(userId, image.blob);
+          if (uploaded) {
+            const { error: updErr } = await supabase
+              .from("st_messages")
+              .update({ image_url: uploaded.publicUrl })
+              .eq("id", userRow.id);
+            if (updErr) {
+              console.warn("[smalltalk] image_url update failed", updErr);
+            } else {
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === userRow.id
+                    ? { ...m, image_url: uploaded!.publicUrl }
+                    : m,
+                ),
+              );
+            }
           }
         }
+        const historyLatestImage =
+          [...messages].reverse().find((m) => m.image_url)?.image_url ?? null;
+        const latestImageUrl = uploaded?.publicUrl ?? historyLatestImage;
+
+        // 5) LLM-Aufruf mit dem aktuellen Verlauf und der ggf. bekannten
+        //    Referenzbild-URL.
+        const response = await callSmalltalkText({
+          messages: apiMessages,
+          systemPrompt,
+          latestImageUrl,
+        });
+        void logUsageFromResponse(userId, response);
 
         // Kurzschluss-Antwort: Claude will ein Bild, das Backend hat
         // bewusst NICHT auf OpenAI gewartet, damit wir jetzt einen
         // dedizierten Loader zeigen können, während Phase 2 läuft.
         if (response.status === "generating_image") {
           const imgPrompt = (response.imagePrompt ?? "").trim();
-          setPendingImage({ prompt: imgPrompt });
+          setPendingImage({ prompt: imgPrompt, mode: "generate" });
           try {
             const result = await callGenerateImage({
               prompt: imgPrompt,
@@ -413,6 +427,47 @@ function SmalltalkChat() {
             // Fehler landet als eigene Assistant-Nachricht genau dort,
             // wo sonst das Bild erschienen wäre – kein generischer
             // Chat-Fehler-Banner am oberen Rand.
+            const assistantRow = await insertMessage({
+              conversationId: conv.id,
+              role: "assistant",
+              content: `⚠️ ${message}`,
+            });
+            setMessages((prev) => [...prev, assistantRow]);
+          } finally {
+            setPendingImage(null);
+          }
+          return true;
+        }
+
+        // Analoger Kurzschluss für Bild-Bearbeitung. `sourceImageUrl`
+        // wurde serverseitig aus dem Verlauf aufgelöst – wir reichen sie
+        // 1:1 an den zweiten Endpoint weiter.
+        if (response.status === "editing_image") {
+          const editPrompt = (response.imagePrompt ?? "").trim();
+          const sourceUrl = (response.sourceImageUrl ?? "").trim();
+          setPendingImage({ prompt: editPrompt, mode: "edit" });
+          try {
+            if (!sourceUrl) {
+              throw {
+                message: "Kein Referenzbild im Gespräch gefunden.",
+              };
+            }
+            const result = await callEditImage({
+              prompt: editPrompt,
+              sourceImageUrl: sourceUrl,
+            });
+            const assistantRow = await insertMessage({
+              conversationId: conv.id,
+              role: "assistant",
+              content: "",
+              imageUrl: result.url,
+            });
+            setMessages((prev) => [...prev, assistantRow]);
+          } catch (imgErr) {
+            const message =
+              imgErr && typeof imgErr === "object" && "message" in imgErr
+                ? String((imgErr as { message: unknown }).message)
+                : "Bild konnte nicht bearbeitet werden.";
             const assistantRow = await insertMessage({
               conversationId: conv.id,
               role: "assistant",
@@ -536,7 +591,7 @@ function SmalltalkChat() {
         ))}
 
         {pendingImage ? (
-          <ImageGeneratingIndicator />
+          <ImageGeneratingIndicator mode={pendingImage.mode} />
         ) : isSending ? (
           <TypingIndicator />
         ) : null}
@@ -1374,12 +1429,18 @@ function TypingIndicator() {
 }
 
 /**
- * Loader für Phase 2 der Bildgenerierung. Ersetzt die Tippanzeige,
- * solange /api/generate-image läuft, damit Nutzer:innen sofort sehen,
- * dass jetzt ein Bild gebaut wird (kann deutlich länger dauern als
- * eine reine Textantwort).
+ * Loader für Phase 2 der Bild-Erzeugung/-Bearbeitung. Ersetzt die
+ * Tippanzeige, solange /api/generate-image bzw. /api/edit-image läuft,
+ * damit Nutzer:innen sofort sehen, was gerade passiert (kann deutlich
+ * länger dauern als eine reine Textantwort).
  */
-function ImageGeneratingIndicator() {
+function ImageGeneratingIndicator({
+  mode,
+}: {
+  mode: "generate" | "edit";
+}) {
+  const label =
+    mode === "edit" ? "Bild wird bearbeitet…" : "Bild wird generiert…";
   return (
     <div className="flex justify-start">
       <div className="flex items-center gap-2 rounded-2xl rounded-bl-md border border-border bg-bg-elevated px-4 py-3 text-sm text-text-muted">
@@ -1387,7 +1448,7 @@ function ImageGeneratingIndicator() {
           className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-accent/30 border-t-accent"
           aria-hidden="true"
         />
-        <span>Bild wird generiert…</span>
+        <span>{label}</span>
       </div>
     </div>
   );

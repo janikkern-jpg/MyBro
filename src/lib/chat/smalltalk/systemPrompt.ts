@@ -67,6 +67,28 @@ function buildGenerateImageGuidance(): string {
   ].join("\n");
 }
 
+// Hinweis für das Bild-Bearbeitungs-Tool `edit_image`. Wichtig ist die
+// klare Abgrenzung zu `generate_image` und der Fallback, wenn KEIN
+// Referenzbild verfügbar ist (dann ist das Tool gar nicht in der
+// Tools-Liste – Claude soll das erkennen und in Textform antworten).
+function buildEditImageGuidance(): string {
+  return [
+    "WERKZEUG: Zusätzlich zu `generate_image` kann `edit_image` verfügbar sein. Es verändert das ZULETZT in dieser Unterhaltung angehängte oder erzeugte Bild anhand eines Text-Prompts.",
+    "",
+    "Wann `edit_image` statt `generate_image`?",
+    "- Der Nutzer bezieht sich erkennbar auf ein bestehendes Bild („das Bild\", „dieses Foto\", „darauf\", „hier\").",
+    "- Es geht um eine VERÄNDERUNG: „füg X hinzu\", „entferne Y\", „ändere die Farbe\", „mach den Hintergrund unscharf\", „ersetze Z durch …\", „tausche … aus\".",
+    "- Für ein komplett NEUES, eigenständiges Bild ohne Bezug zu einem vorhandenen bleibt `generate_image` richtig.",
+    "",
+    "Regeln:",
+    "- Der `prompt` beschreibt NUR die gewünschte Änderung, nicht das ganze Bild neu.",
+    "- Kein `size`-Feld – die Ergebnisgröße orientiert sich am Original.",
+    "- Nach erfolgreichem Aufruf wird das veränderte Bild automatisch unter deiner Antwort angezeigt. Ein kurzer Satz reicht (z. B. „So sieht es mit … aus.\").",
+    "- WICHTIG: Wenn `edit_image` in der Tools-Liste FEHLT, obwohl der Nutzer eine Bildbearbeitung möchte, gibt es kein Referenzbild im Verlauf. Rufe dann WEDER `edit_image` NOCH `generate_image` auf, sondern antworte kurz im Chat: dass du kein Bild zum Bearbeiten findest und der Nutzer bitte eins anhängen soll.",
+    "- Bei einem Fehler-Tool-Result gib den Fehlertext weiter. Bei „Bildbearbeitung noch nicht freigeschaltet – Organization Verification auf platform.openai.com nötig.\" zitiere den Satz wörtlich.",
+  ].join("\n");
+}
+
 /**
  * Baut den Smalltalk-System-Prompt aus den ausgefüllten Prinzipien-Zeilen.
  * Leere Felder (weder title noch body) werden ignoriert. Sind ALLE Zeilen
@@ -80,7 +102,7 @@ export function buildSmalltalkSystemPrompt(
     .filter((p) => (p.title ?? "").trim() || (p.body ?? "").trim());
 
   if (filled.length === 0) {
-    return `${NEUTRAL_DEFAULT}\n\n${GUIDANCE}\n\n${buildWebSearchGuidance()}\n\n${buildCreateFileGuidance()}\n\n${buildGenerateImageGuidance()}`;
+    return `${NEUTRAL_DEFAULT}\n\n${GUIDANCE}\n\n${buildWebSearchGuidance()}\n\n${buildCreateFileGuidance()}\n\n${buildGenerateImageGuidance()}\n\n${buildEditImageGuidance()}`;
   }
 
   const lines = filled.map((p, i) => {
@@ -101,5 +123,7 @@ export function buildSmalltalkSystemPrompt(
     buildCreateFileGuidance(),
     "",
     buildGenerateImageGuidance(),
+    "",
+    buildEditImageGuidance(),
   ].join("\n");
 }

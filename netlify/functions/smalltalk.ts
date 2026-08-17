@@ -20,6 +20,7 @@ import {
 import {
   GENERATE_IMAGE_TOOL,
 } from "./_shared/generateImage";
+import { EDIT_IMAGE_TOOL } from "./_shared/editImage";
 
 // Smalltalk-Chat-Endpoint. Eigenständiger Zweig (kein MyBro-Kontext), mit:
 // - gemeinsamem Modell-Routing (haiku/sonnet/opus je nach Komplexität)
@@ -39,6 +40,10 @@ import {
 type SmalltalkRequestBody = {
   messages: AnthropicMessage[];
   systemPrompt?: string;
+  // URL des zuletzt in dieser Unterhaltung angehängten oder erzeugten
+  // Bildes (aus messages[].image_url). Wird nur für das `edit_image`-
+  // Tool benötigt – fehlt sie, wird das Tool gar nicht erst angeboten.
+  latestImageUrl?: string | null;
 };
 
 const MAX_TOKENS = 4096;
@@ -113,19 +118,27 @@ type ContentBlockJson = Record<string, unknown>;
 //  - "generate_image_requested" → Claude hat das generate_image-Tool
 //    aufgerufen; der eigentliche OpenAI-Call wird nicht hier gemacht,
 //    sondern der Client soll den zweiten Endpoint anstoßen.
+//  - "edit_image_requested"     → analog für edit_image; enthält die
+//    aufgelöste sourceImageUrl, die der Client dann an
+//    /api/edit-image weiterreicht.
 type ToolLoopResult =
   | { kind: "final"; outcome: FetchOutcome }
   | {
       kind: "generate_image_requested";
       prompt: string;
       size: string | null;
+    }
+  | {
+      kind: "edit_image_requested";
+      prompt: string;
+      sourceImageUrl: string;
     };
 
 /**
  * Sammelt alle `tool_use`-Blöcke, die auf ein *client*-Tool zeigen
- * (aktuell `create_file` und `generate_image`). Server-Tools
- * (`web_search`) laufen innerhalb der Anthropic-API und tauchen als
- * `server_tool_use` auf – die brauchen wir NICHT selbst zu bedienen.
+ * (aktuell `create_file`, `generate_image` und `edit_image`). Server-
+ * Tools (`web_search`) laufen innerhalb der Anthropic-API und tauchen
+ * als `server_tool_use` auf – die brauchen wir NICHT selbst zu bedienen.
  */
 function extractClientToolUses(
   parsed: Record<string, unknown>,
@@ -138,7 +151,12 @@ function extractClientToolUses(
     if (b?.type !== "tool_use") continue;
     const id = typeof b.id === "string" ? b.id : "";
     const name = typeof b.name === "string" ? b.name : "";
-    if (id && (name === "create_file" || name === "generate_image")) {
+    if (
+      id &&
+      (name === "create_file" ||
+        name === "generate_image" ||
+        name === "edit_image")
+    ) {
       uses.push({ id, name, input: b.input });
     }
   }
@@ -158,6 +176,12 @@ async function runToolLoop(opts: {
     supabaseUrl: string;
     supabaseAnonKey: string;
   } | null;
+  // Für `edit_image` benötigen wir die zuletzt in der Unterhaltung
+  // vorhandene Bild-URL. Ist sie null, wurde das Tool bereits nicht
+  // angeboten – wir behandeln den Fall zur Sicherheit trotzdem
+  // defensiv (wenn Claude es doch aufruft, geben wir einen
+  // is_error-tool_result zurück).
+  latestImageUrl: string | null;
 }): Promise<ToolLoopResult> {
   const messages = [
     ...((opts.initialBody.messages as AnthropicMessage[]) ?? []),
@@ -201,10 +225,10 @@ async function runToolLoop(opts: {
       return { kind: "final", outcome };
     }
 
-    // Bild-Wunsch hat Priorität: sobald Claude in diesem Turn
-    // `generate_image` anfordert, brechen wir den Loop ab und lassen
-    // das Frontend den zweiten Endpoint aufrufen. Damit sieht der
-    // Nutzer sofort einen dedizierten "Bild wird generiert"-Loader.
+    // Bild-Wünsche (generate/edit) haben Priorität: sobald Claude in
+    // diesem Turn eines der beiden Tools anfordert, brechen wir den
+    // Loop ab und lassen das Frontend den zweiten Endpoint aufrufen.
+    // Damit sieht der Nutzer sofort einen dedizierten Loader.
     const imageUse = toolUses.find((u) => u.name === "generate_image");
     if (imageUse) {
       const input =
@@ -221,6 +245,23 @@ async function runToolLoop(opts: {
         `[smalltalk] short-circuit: generate_image requested (promptLen=${prompt.length}, size=${size ?? "default"})`,
       );
       return { kind: "generate_image_requested", prompt, size };
+    }
+    const editUse = toolUses.find((u) => u.name === "edit_image");
+    if (editUse && opts.latestImageUrl) {
+      const input =
+        editUse.input && typeof editUse.input === "object"
+          ? (editUse.input as Record<string, unknown>)
+          : {};
+      const prompt =
+        typeof input.prompt === "string" ? input.prompt.trim() : "";
+      console.log(
+        `[smalltalk] short-circuit: edit_image requested (promptLen=${prompt.length})`,
+      );
+      return {
+        kind: "edit_image_requested",
+        prompt,
+        sourceImageUrl: opts.latestImageUrl,
+      };
     }
 
     // Assistant-Turn (die komplette content-Liste!) übernehmen und
@@ -282,6 +323,21 @@ async function runToolLoop(opts: {
           is_error: true,
           content:
             "Bildgenerierung wird vom Frontend übernommen – dieses Tool sollte serverseitig nicht ausgeführt werden.",
+        });
+        continue;
+      }
+
+      if (use.name === "edit_image") {
+        // Hier landen wir nur, wenn Claude `edit_image` aufruft, aber
+        // kein Referenzbild in der Unterhaltung existiert (dann wurde
+        // der Short-Circuit oben übersprungen). Wir sagen Claude: bitte
+        // stattdessen dem Nutzer normal antworten und ein Bild anfordern.
+        toolResultBlocks.push({
+          type: "tool_result",
+          tool_use_id: use.id,
+          is_error: true,
+          content:
+            "Kein Referenzbild in dieser Unterhaltung gefunden. Antworte dem Nutzer stattdessen im Chat, dass er ein Bild anhängen soll, und rufe dieses Tool nicht erneut auf.",
         });
         continue;
       }
@@ -458,6 +514,11 @@ export default async (req: Request, _context: Context): Promise<Response> => {
   }
 
   const { messages, systemPrompt } = payload ?? {};
+  const latestImageUrl =
+    typeof payload?.latestImageUrl === "string" &&
+    payload.latestImageUrl.trim().length > 0
+      ? payload.latestImageUrl.trim()
+      : null;
 
   if (!Array.isArray(messages) || messages.length === 0) {
     return errorResponse(
@@ -498,6 +559,9 @@ export default async (req: Request, _context: Context): Promise<Response> => {
   if (!webSearchDisabled) tools.push(WEB_SEARCH_TOOL);
   if (fileEnvReady) tools.push(CREATE_FILE_TOOL);
   if (fileEnvReady) tools.push(GENERATE_IMAGE_TOOL);
+  // `edit_image` nur anbieten, wenn wirklich ein Referenzbild da ist.
+  // Fehlt es, sagt der System-Prompt Claude, in Textform zu antworten.
+  if (fileEnvReady && latestImageUrl) tools.push(EDIT_IMAGE_TOOL);
 
   const anthropicBody: Record<string, unknown> = {
     max_tokens: MAX_TOKENS,
@@ -525,6 +589,7 @@ export default async (req: Request, _context: Context): Promise<Response> => {
     providerTag: `claude-smalltalk-${selection.models[0]}`,
     createdFiles,
     fileEnv,
+    latestImageUrl,
   });
 
   if (result.kind === "generate_image_requested") {
@@ -532,6 +597,14 @@ export default async (req: Request, _context: Context): Promise<Response> => {
       status: "generating_image",
       imagePrompt: result.prompt,
       imageSize: result.size,
+      _usage: usageBucket,
+    });
+  }
+  if (result.kind === "edit_image_requested") {
+    return jsonResponse(200, {
+      status: "editing_image",
+      imagePrompt: result.prompt,
+      sourceImageUrl: result.sourceImageUrl,
       _usage: usageBucket,
     });
   }

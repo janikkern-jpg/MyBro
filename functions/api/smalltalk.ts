@@ -19,6 +19,7 @@ import {
 import {
   GENERATE_IMAGE_TOOL,
 } from "../_shared/generateImage";
+import { EDIT_IMAGE_TOOL } from "../_shared/editImage";
 import type { Env, PagesHandler } from "../_shared/pages";
 
 // Smalltalk-Chat-Endpoint (Cloudflare Pages Functions).
@@ -28,6 +29,7 @@ import type { Env, PagesHandler } from "../_shared/pages";
 type SmalltalkRequestBody = {
   messages: AnthropicMessage[];
   systemPrompt?: string;
+  latestImageUrl?: string | null;
 };
 
 const MAX_TOKENS = 4096;
@@ -96,6 +98,11 @@ type ToolLoopResult =
       kind: "generate_image_requested";
       prompt: string;
       size: string | null;
+    }
+  | {
+      kind: "edit_image_requested";
+      prompt: string;
+      sourceImageUrl: string;
     };
 
 function extractClientToolUses(
@@ -109,7 +116,12 @@ function extractClientToolUses(
     if (b?.type !== "tool_use") continue;
     const id = typeof b.id === "string" ? b.id : "";
     const name = typeof b.name === "string" ? b.name : "";
-    if (id && (name === "create_file" || name === "generate_image")) {
+    if (
+      id &&
+      (name === "create_file" ||
+        name === "generate_image" ||
+        name === "edit_image")
+    ) {
       uses.push({ id, name, input: b.input });
     }
   }
@@ -129,6 +141,7 @@ async function runToolLoop(opts: {
     supabaseUrl: string;
     supabaseAnonKey: string;
   } | null;
+  latestImageUrl: string | null;
 }): Promise<ToolLoopResult> {
   const messages = [
     ...((opts.initialBody.messages as AnthropicMessage[]) ?? []),
@@ -188,6 +201,23 @@ async function runToolLoop(opts: {
       );
       return { kind: "generate_image_requested", prompt, size };
     }
+    const editUse = toolUses.find((u) => u.name === "edit_image");
+    if (editUse && opts.latestImageUrl) {
+      const input =
+        editUse.input && typeof editUse.input === "object"
+          ? (editUse.input as Record<string, unknown>)
+          : {};
+      const prompt =
+        typeof input.prompt === "string" ? input.prompt.trim() : "";
+      console.log(
+        `[smalltalk] short-circuit: edit_image requested (promptLen=${prompt.length})`,
+      );
+      return {
+        kind: "edit_image_requested",
+        prompt,
+        sourceImageUrl: opts.latestImageUrl,
+      };
+    }
     messages.push({
       role: "assistant",
       content: parsed.content as unknown,
@@ -243,6 +273,17 @@ async function runToolLoop(opts: {
           is_error: true,
           content:
             "Bildgenerierung wird vom Frontend übernommen – dieses Tool sollte serverseitig nicht ausgeführt werden.",
+        });
+        continue;
+      }
+
+      if (use.name === "edit_image") {
+        toolResultBlocks.push({
+          type: "tool_result",
+          tool_use_id: use.id,
+          is_error: true,
+          content:
+            "Kein Referenzbild in dieser Unterhaltung gefunden. Antworte dem Nutzer stattdessen im Chat, dass er ein Bild anhängen soll, und rufe dieses Tool nicht erneut auf.",
         });
         continue;
       }
@@ -406,6 +447,11 @@ export const onRequestPost: PagesHandler = async ({ request, env }) => {
   }
 
   const { messages, systemPrompt } = payload ?? {};
+  const latestImageUrl =
+    typeof payload?.latestImageUrl === "string" &&
+    payload.latestImageUrl.trim().length > 0
+      ? payload.latestImageUrl.trim()
+      : null;
 
   if (!Array.isArray(messages) || messages.length === 0) {
     return errorResponse(
@@ -441,6 +487,7 @@ export const onRequestPost: PagesHandler = async ({ request, env }) => {
   if (!webSearchDisabled) tools.push(WEB_SEARCH_TOOL);
   if (fileEnvReady) tools.push(CREATE_FILE_TOOL);
   if (fileEnvReady) tools.push(GENERATE_IMAGE_TOOL);
+  if (fileEnvReady && latestImageUrl) tools.push(EDIT_IMAGE_TOOL);
 
   const anthropicBody: Record<string, unknown> = {
     max_tokens: MAX_TOKENS,
@@ -468,6 +515,7 @@ export const onRequestPost: PagesHandler = async ({ request, env }) => {
     providerTag: `claude-smalltalk-${selection.models[0]}`,
     createdFiles,
     fileEnv,
+    latestImageUrl,
   });
 
   if (result.kind === "generate_image_requested") {
@@ -475,6 +523,14 @@ export const onRequestPost: PagesHandler = async ({ request, env }) => {
       status: "generating_image",
       imagePrompt: result.prompt,
       imageSize: result.size,
+      _usage: usageBucket,
+    });
+  }
+  if (result.kind === "edit_image_requested") {
+    return jsonResponse(200, {
+      status: "editing_image",
+      imagePrompt: result.prompt,
+      sourceImageUrl: result.sourceImageUrl,
       _usage: usageBucket,
     });
   }

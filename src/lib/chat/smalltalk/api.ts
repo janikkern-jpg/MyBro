@@ -54,15 +54,27 @@ async function authorizedHeaders(): Promise<Record<string, string>> {
 export async function callSmalltalkText(payload: {
   messages: StApiMessage[];
   systemPrompt: string;
+  // Optional: URL des zuletzt in der Unterhaltung angehängten oder
+  // erzeugten Bildes. Wenn gesetzt, aktiviert der Server das
+  // `edit_image`-Tool; ohne diese URL wird das Tool gar nicht erst
+  // angeboten (und Claude sagt in Textform, dass der Nutzer ein Bild
+  // anhängen soll).
+  latestImageUrl?: string | null;
 }): Promise<StChatResponse> {
   // Access-Token mitschicken, damit der Server die client-seitigen Tools
-  // (`create_file`, `generate_image`) aktivieren kann – die Uploads
-  // laufen über genau dieses Token, RLS erzwingt den eigenen Unterordner.
+  // (`create_file`, `generate_image`, `edit_image`) aktivieren kann – die
+  // Uploads laufen über genau dieses Token, RLS erzwingt den eigenen
+  // Unterordner.
   const headers = await authorizedHeaders();
+  const body: Record<string, unknown> = {
+    messages: payload.messages,
+    systemPrompt: payload.systemPrompt,
+  };
+  if (payload.latestImageUrl) body.latestImageUrl = payload.latestImageUrl;
   const res = await fetch("/api/smalltalk", {
     method: "POST",
     headers,
-    body: JSON.stringify(payload),
+    body: JSON.stringify(body),
   });
   const json = await parseJsonSafe(res);
   if (!res.ok) {
@@ -126,6 +138,53 @@ function isImageOkPayload(
     typeof rec.url === "string" &&
     typeof rec.size === "string" &&
     typeof rec.prompt === "string"
+  );
+}
+
+/**
+ * Zweite Phase der Bild-Bearbeitung: `edit_image` (Referenzbild +
+ * Text-Prompt). Ansonsten Verhalten identisch zu `callGenerateImage`.
+ */
+export async function callEditImage(payload: {
+  prompt: string;
+  sourceImageUrl: string;
+}): Promise<{ url: string; prompt: string; sourceUrl: string; path: string }> {
+  const headers = await authorizedHeaders();
+  const res = await fetch("/api/edit-image", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      prompt: payload.prompt,
+      sourceImageUrl: payload.sourceImageUrl,
+    }),
+  });
+  const json = await parseJsonSafe(res);
+  if (!res.ok || !isEditOkPayload(json)) {
+    const err: SmalltalkApiError = {
+      status: res.status,
+      message: extractError(json, res.status),
+      details: json,
+    };
+    throw err;
+  }
+  return {
+    url: json.url,
+    prompt: json.prompt,
+    sourceUrl: json.sourceUrl,
+    path: typeof json.path === "string" ? json.path : "",
+  };
+}
+
+function isEditOkPayload(
+  json: unknown,
+): json is { url: string; prompt: string; sourceUrl: string; path?: string } {
+  if (!json || typeof json !== "object") return false;
+  const rec = json as Record<string, unknown>;
+  return (
+    rec.ok === true &&
+    typeof rec.url === "string" &&
+    typeof rec.prompt === "string" &&
+    typeof rec.sourceUrl === "string"
   );
 }
 
