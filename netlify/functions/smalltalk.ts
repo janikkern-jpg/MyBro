@@ -540,12 +540,34 @@ export default async (req: Request, _context: Context): Promise<Response> => {
   // Wenn ein Referenzbild vorliegt, MUSS das Modell zuverlässig zwischen
   // `edit_image` und Text-Antwort entscheiden – Haiku ignoriert die
   // Tool-Regeln dafür zu oft. Escaliere in diesem Fall auf Sonnet und
-  // füge Haiku nur als letzten Fallback hinzu.
+  // füge Haiku nur als letzten Fallback hinzu. Dasselbe gilt, wenn der
+  // Nutzer in der letzten Message über Bilder/Bearbeitung spricht:
+  // Haiku sagt sonst reflexartig "kann ich nicht", weil das gegen
+  // Standard-Trainingsdaten geht.
+  const lastUserText = ((): string => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i] as { role?: string; content?: unknown };
+      if (m.role !== "user") continue;
+      if (typeof m.content === "string") return m.content.toLowerCase();
+      if (Array.isArray(m.content)) {
+        for (const block of m.content) {
+          const t = (block as { type?: string; text?: unknown })?.text;
+          if (typeof t === "string") return t.toLowerCase();
+        }
+      }
+      return "";
+    }
+    return "";
+  })();
+  const imageIntent =
+    /\b(bild|bilder|foto|fotos|photo|photos|bearbeit|edit|veränder|retusch|generier|zeichn|illustrat)/.test(
+      lastUserText,
+    );
   let models: readonly string[] = selection.models;
-  if (latestImageUrl && models[0] === "claude-haiku-4-5") {
+  if ((latestImageUrl || imageIntent) && models[0] === "claude-haiku-4-5") {
     models = ["claude-sonnet-5", "claude-haiku-4-5"];
     console.log(
-      "[smalltalk] latestImageUrl vorhanden – hebe Routing auf Sonnet an.",
+      `[smalltalk] escaliere auf Sonnet (latestImageUrl=${Boolean(latestImageUrl)}, imageIntent=${imageIntent}).`,
     );
   }
   console.log(
@@ -633,6 +655,30 @@ export default async (req: Request, _context: Context): Promise<Response> => {
         ` token=${accessToken ? "yes" : "no"}, userId=${userId ? "yes" : "no"},` +
         ` SUPABASE_URL=${supabaseUrl ? "yes" : "no"}, SUPABASE_ANON_KEY=${supabaseAnonKey ? "yes" : "no"}.`,
     );
+  }
+
+  // Debug-Echo: liefert das komplette Payload (System-Prompt + Tools +
+  // Modelle) zurück, ohne Anthropic zu callen. Erlaubt nachzuprüfen,
+  // was der aktuell deployte Server tatsächlich schickt – ohne dass ein
+  // JWT nötig ist. Aktiviert durch `?debug=echo` in der URL ODER durch
+  // Header `x-smalltalk-debug: echo`.
+  const url = new URL(req.url);
+  const debugFlag =
+    url.searchParams.get("debug") === "echo" ||
+    (req.headers.get("x-smalltalk-debug") || "").toLowerCase() === "echo";
+  if (debugFlag) {
+    return jsonResponse(200, {
+      _debug: "echo",
+      commit: process.env.COMMIT_REF || null,
+      deploy_id: process.env.DEPLOY_ID || null,
+      complexity: selection.complexity,
+      models,
+      fileEnvReady,
+      latestImageUrlPresent: latestImageUrl !== null,
+      imageIntent,
+      tools_names: tools.map((t) => (t as { name?: string }).name || "?"),
+      system: combinedSystem,
+    });
   }
 
   const createdFiles: CreatedFile[] = [];

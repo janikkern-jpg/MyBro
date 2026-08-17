@@ -470,11 +470,30 @@ export const onRequestPost: PagesHandler = async ({ request, env }) => {
   }
 
   const selection = await selectModelForMessages(messages, apiKey);
+  const lastUserText = ((): string => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i] as { role?: string; content?: unknown };
+      if (m.role !== "user") continue;
+      if (typeof m.content === "string") return m.content.toLowerCase();
+      if (Array.isArray(m.content)) {
+        for (const block of m.content) {
+          const t = (block as { type?: string; text?: unknown })?.text;
+          if (typeof t === "string") return t.toLowerCase();
+        }
+      }
+      return "";
+    }
+    return "";
+  })();
+  const imageIntent =
+    /\b(bild|bilder|foto|fotos|photo|photos|bearbeit|edit|veränder|retusch|generier|zeichn|illustrat)/.test(
+      lastUserText,
+    );
   let models: readonly string[] = selection.models;
-  if (latestImageUrl && models[0] === "claude-haiku-4-5") {
+  if ((latestImageUrl || imageIntent) && models[0] === "claude-haiku-4-5") {
     models = ["claude-sonnet-5", "claude-haiku-4-5"];
     console.log(
-      "[smalltalk] latestImageUrl vorhanden – hebe Routing auf Sonnet an.",
+      `[smalltalk] escaliere auf Sonnet (latestImageUrl=${Boolean(latestImageUrl)}, imageIntent=${imageIntent}).`,
     );
   }
   console.log(
@@ -548,6 +567,24 @@ export const onRequestPost: PagesHandler = async ({ request, env }) => {
         ` token=${accessToken ? "yes" : "no"}, userId=${userId ? "yes" : "no"},` +
         ` SUPABASE_URL=${supabaseUrl ? "yes" : "no"}, SUPABASE_ANON_KEY=${supabaseAnonKey ? "yes" : "no"}.`,
     );
+  }
+
+  const url = new URL(req.url);
+  const debugFlag =
+    url.searchParams.get("debug") === "echo" ||
+    (req.headers.get("x-smalltalk-debug") || "").toLowerCase() === "echo";
+  if (debugFlag) {
+    return jsonResponse(200, {
+      _debug: "echo",
+      commit: process.env.COMMIT_REF || null,
+      complexity: selection.complexity,
+      models,
+      fileEnvReady,
+      latestImageUrlPresent: latestImageUrl !== null,
+      imageIntent,
+      tools_names: tools.map((t) => (t as { name?: string }).name || "?"),
+      system: combinedSystem,
+    });
   }
 
   const createdFiles: CreatedFile[] = [];
