@@ -26,6 +26,11 @@ export const PRICING: Record<string, { input: number; output: number }> = {
   "gpt-image-1": { input: 5, output: 40 },
 };
 
+// Anthropic Web-Search (server-side tool): USD pro Suchanfrage.
+// Referenz: https://docs.anthropic.com/... – 10 USD / 1000 Suchen.
+export const WEB_SEARCH_MODEL = "web_search_20250305";
+export const WEB_SEARCH_USD_PER_REQUEST = 0.01;
+
 export type UsageRecord = {
   provider: Provider;
   model: string;
@@ -91,6 +96,36 @@ export function usageFromAnthropicJson(
   const output = Number(usage.output_tokens ?? 0);
   const model = typeof obj.model === "string" ? obj.model : fallbackModel;
   return toRecord("anthropic", model, input, output);
+}
+
+/**
+ * Anthropic zählt in `usage.server_tool_use.web_search_requests` die
+ * Zahl der tatsächlich ausgeführten Websuchen. Diese werden zusätzlich
+ * zu den Token-Kosten berechnet (Pauschale pro Suche). Wir erzeugen
+ * einen eigenen UsageRecord mit 0 Tokens und dem berechneten Cost, damit
+ * die Kosten im usage_log getrennt sichtbar bleiben.
+ */
+export function usageForAnthropicWebSearch(
+  parsed: unknown,
+): UsageRecord | null {
+  if (!parsed || typeof parsed !== "object") return null;
+  const usage = (parsed as {
+    usage?: {
+      server_tool_use?: { web_search_requests?: unknown };
+    };
+  }).usage;
+  const count = Number(usage?.server_tool_use?.web_search_requests ?? 0);
+  if (!Number.isFinite(count) || count <= 0) return null;
+  const rounded = Math.max(0, Math.round(count));
+  const cost =
+    Math.round(rounded * WEB_SEARCH_USD_PER_REQUEST * 1_000_000) / 1_000_000;
+  return {
+    provider: "anthropic",
+    model: WEB_SEARCH_MODEL,
+    input_tokens: 0,
+    output_tokens: 0,
+    estimated_cost_usd: cost,
+  };
 }
 
 /** Bequemer Wrapper, wenn nur der rohe Response-Text vorliegt. */

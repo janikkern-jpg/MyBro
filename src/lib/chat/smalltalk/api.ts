@@ -2,6 +2,8 @@ import type {
   StApiMessage,
   StChatResponse,
   StImageResponse,
+  StResponseTextBlock,
+  StSource,
 } from "./types";
 
 export type SmalltalkApiError = {
@@ -81,4 +83,79 @@ export function extractAssistantText(resp: StChatResponse): string {
     .map((b) => b.text as string)
     .join("\n\n")
     .trim();
+}
+
+/**
+ * Extrahiert Quellen aus web_search-Zitationen der Anthropic-Response.
+ * Dedupliziert nach URL (erste Nennung gewinnt) und filtert Einträge ohne
+ * URL heraus. Reihenfolge bleibt stabil (Zitations-Reihenfolge des LLM).
+ */
+export function extractSources(resp: StChatResponse): StSource[] {
+  const seen = new Set<string>();
+  const out: StSource[] = [];
+  for (const block of resp.content ?? []) {
+    if (!block || block.type !== "text") continue;
+    const citations = (block as StResponseTextBlock).citations;
+    if (!Array.isArray(citations)) continue;
+    for (const c of citations) {
+      if (!c || c.type !== "web_search_result_location") continue;
+      const url = (c.url ?? "").trim();
+      if (!url || seen.has(url)) continue;
+      seen.add(url);
+      const rawTitle = (c.title ?? "").trim();
+      out.push({ title: rawTitle || url, url });
+    }
+  }
+  return out;
+}
+
+// Serialisierungs-Marker für Quellen im gespeicherten Nachrichteninhalt.
+// Absichtlich distinktiv gewählt (doppelte eckige Klammern + Präfix), damit
+// natürlicher Nutzer-Text nicht kollidiert und der Marker leicht per Regex
+// wieder rausparsebar ist.
+const SOURCES_MARKER_PREFIX = "[[MYBRO_SOURCES:";
+const SOURCES_MARKER_SUFFIX = "]]";
+const SOURCES_MARKER_RE = /\n\n\[\[MYBRO_SOURCES:([\s\S]+?)\]\]\s*$/;
+
+/**
+ * Hängt Quellen als Marker-Block an den Assistant-Text an, damit sie
+ * zusammen mit der Nachricht in st_messages.content persistieren. Beim
+ * Rendern wird der Marker per parseAssistantContent wieder abgespalten.
+ */
+export function serializeAssistantContent(
+  text: string,
+  sources: readonly StSource[],
+): string {
+  if (sources.length === 0) return text;
+  const json = JSON.stringify(sources);
+  return `${text}\n\n${SOURCES_MARKER_PREFIX}${json}${SOURCES_MARKER_SUFFIX}`;
+}
+
+/**
+ * Umkehrung zu serializeAssistantContent: trennt sichtbaren Text von
+ * Quellenliste. Wenn kein Marker gefunden wird oder er ungültig ist,
+ * wird der Original-Content unverändert zurückgegeben.
+ */
+export function parseAssistantContent(content: string): {
+  text: string;
+  sources: StSource[];
+} {
+  const match = content.match(SOURCES_MARKER_RE);
+  if (!match) return { text: content, sources: [] };
+  try {
+    const parsed = JSON.parse(match[1]) as unknown;
+    if (!Array.isArray(parsed)) return { text: content, sources: [] };
+    const sources: StSource[] = [];
+    for (const item of parsed) {
+      if (!item || typeof item !== "object") continue;
+      const rec = item as Record<string, unknown>;
+      const url = typeof rec.url === "string" ? rec.url.trim() : "";
+      const title = typeof rec.title === "string" ? rec.title.trim() : "";
+      if (!url) continue;
+      sources.push({ title: title || url, url });
+    }
+    return { text: content.slice(0, match.index).trimEnd(), sources };
+  } catch {
+    return { text: content, sources: [] };
+  }
 }

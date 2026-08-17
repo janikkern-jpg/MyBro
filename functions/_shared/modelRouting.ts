@@ -92,6 +92,26 @@ export function lastUserText(messages: AnthropicMessage[]): string {
 }
 
 /**
+ * Prüft, ob mindestens eine Nachricht einen Bild-Content-Block enthält.
+ * Wird genutzt, um die günstige Haiku-Komplexitäts-Klassifikation zu
+ * überspringen, sobald ein Bild im Spiel ist – Bildanalyse ist nie
+ * "trivial" und würde vom Klassifikator ohnehin nicht erkannt (er sieht
+ * ja nur Text). Wir routen bei Bildern direkt auf Sonnet.
+ */
+export function messagesContainImage(messages: AnthropicMessage[]): boolean {
+  for (const m of messages) {
+    if (!Array.isArray(m.content)) continue;
+    for (const block of m.content) {
+      if (block && typeof block === "object") {
+        const b = block as Record<string, unknown>;
+        if (b.type === "image") return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
  * Kurzer Klassifikations-Roundtrip. Liefert die erkannte Stufe oder
  * `null`, wenn nichts Verwertbares zurückkommt. Ist absichtlich sehr
  * knappe Nutzung von Tokens: 8 Response-Tokens genügen für ein Wort,
@@ -169,11 +189,24 @@ export type ModelSelection = {
  * fehlender/leerer User-Nachricht ODER Klassifikator-Fehler wird
  * "mittel" (Sonnet) als sicherer Standard verwendet – wie in der
  * Produkt-Spezifikation gefordert.
+ *
+ * Sonderfall: Sobald mindestens eine Nachricht einen Bild-Content-Block
+ * enthält, überspringen wir die günstige Haiku-Klassifikation komplett
+ * und wählen direkt "mittel" (Sonnet). Bildanalyse ist immer nicht-trivial
+ * und der Klassifikator würde das Bild ohnehin nicht sehen.
  */
 export async function selectModelForMessages(
   messages: AnthropicMessage[],
   apiKey: string,
 ): Promise<ModelSelection> {
+  if (messagesContainImage(messages)) {
+    return {
+      complexity: DEFAULT_COMPLEXITY,
+      fromFallback: true,
+      models: MODEL_CHAINS[DEFAULT_COMPLEXITY],
+      classifierUsage: null,
+    };
+  }
   const userText = lastUserText(messages);
   if (userText.length === 0) {
     return {

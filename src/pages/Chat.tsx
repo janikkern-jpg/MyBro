@@ -21,6 +21,7 @@ import {
   type ChallengeDay,
   type ContentBlock,
   type DbMessage,
+  type ImageBlock,
   type Profile,
   type TextBlock,
   type ToolResultBlock,
@@ -30,6 +31,9 @@ import {
   callSmalltalkImage,
   callSmalltalkText,
   extractAssistantText,
+  extractSources,
+  parseAssistantContent,
+  serializeAssistantContent,
 } from "../lib/chat/smalltalk/api";
 import { detectImageIntent, extractImagePrompt } from "../lib/chat/smalltalk/intent";
 import { buildSmalltalkSystemPrompt } from "../lib/chat/smalltalk/systemPrompt";
@@ -52,6 +56,12 @@ import type {
   SmalltalkProject,
   StApiMessage,
 } from "../lib/chat/smalltalk/types";
+import { ChatComposer } from "../components/ChatComposer";
+import { ChatImage } from "../components/ChatImage";
+import {
+  uploadChatImage,
+  type PreparedImage,
+} from "../lib/chat/imageUtils";
 
 const ONBOARDING_TRIGGER =
   "[Systemhinweis: Eröffne jetzt ein ruhiges Kennenlerngespräch. Begrüße kurz und warm und stelle eine erste offene Frage.]";
@@ -72,6 +82,32 @@ function isVisibleMessage(m: DbMessage): boolean {
 
 function dbToApi(msgs: DbMessage[]): ApiMessage[] {
   return msgs.map((m) => ({ role: m.role, content: m.content }));
+}
+
+// Baut den Content für einen User-Turn, der zusätzlich zum Text ein
+// aktuelles Bild enthalten soll. Wird von beiden Chat-Modi genutzt und
+// erzeugt das Anthropic-Content-Block-Array in der offiziellen
+// Reihenfolge: Bild zuerst, dann Text – so wie es die Vision-Beispiele
+// von Anthropic empfehlen.
+function buildUserContentWithImage(
+  text: string,
+  image: PreparedImage,
+): ContentBlock[] {
+  const blocks: ContentBlock[] = [];
+  const imgBlock: ImageBlock = {
+    type: "image",
+    source: {
+      type: "base64",
+      media_type: image.mediaType,
+      data: image.base64,
+    },
+  };
+  blocks.push(imgBlock);
+  const trimmed = text.trim();
+  if (trimmed) {
+    blocks.push({ type: "text", text: trimmed });
+  }
+  return blocks;
 }
 
 export default function ChatPage() {
@@ -267,13 +303,23 @@ function SmalltalkChat() {
   );
 
   const sendMessage = useCallback(
-    async (text: string): Promise<boolean> => {
+    async (
+      text: string,
+      image: PreparedImage | null,
+    ): Promise<boolean> => {
       const trimmed = text.trim();
-      if (!trimmed) return false;
+      // Bild allein (ohne Text) ist erlaubt: Sonnet analysiert das Bild
+      // und beschreibt/kommentiert es. Deshalb hier nicht auf leeren Text
+      // abbrechen, wenn ein Bild da ist.
+      if (!trimmed && !image) return false;
       setError(null);
       setIsSending(true);
       try {
-        const conv = await ensureConversation(trimmed);
+        const conv = await ensureConversation(trimmed || "Bild");
+
+        // 1) User-Row insertieren (image_url wird nachgereicht, sobald
+        //    der Storage-Upload fertig ist – so blockiert der Upload den
+        //    LLM-Call nicht).
         const userRow = await insertMessage({
           conversationId: conv.id,
           role: "user",
@@ -281,8 +327,10 @@ function SmalltalkChat() {
         });
         setMessages((prev) => [...prev, userRow]);
 
-        // ---- Bild-Wunsch? ----------------------------------------------
-        if (detectImageIntent(trimmed)) {
+        // 2) Bei Bild-Attachment NIEMALS DALL-E anstoßen – der User
+        //    schickt ein Foto zur Analyse, nicht als Text-Prompt für
+        //    Bildgenerierung.
+        if (!image && detectImageIntent(trimmed)) {
           const imagePrompt = extractImagePrompt(trimmed);
           const imgResp = await callSmalltalkImage({ prompt: imagePrompt });
           void logUsageFromResponse(userId, imgResp);
@@ -297,51 +345,89 @@ function SmalltalkChat() {
           return true;
         }
 
-        // ---- Text-Antwort (Anthropic mit Klassifikator + OpenAI-Fallback) ----
-        // Kein Kontext aus anderen Unterhaltungen – nur der aktuelle Verlauf.
+        // 3) API-Verlauf bauen. Historische Bilder werden nicht erneut
+        //    als Base64 nachgeladen – nur das AKTUELLE User-Turn-Bild
+        //    (falls vorhanden) wird als Anthropic-Image-Block im letzten
+        //    User-Content-Array eingebettet.
+        const historyMessages: StApiMessage[] = messages.map<StApiMessage>((m) => ({
+          role: m.role,
+          content: m.content,
+        }));
+        const currentUserContent: string | ContentBlock[] = image
+          ? buildUserContentWithImage(trimmed, image)
+          : trimmed;
         const apiMessages: StApiMessage[] = [
-          ...messages.map<StApiMessage>((m) => ({
-            role: m.role,
-            content: m.content,
-          })),
-          { role: "user", content: trimmed },
+          ...historyMessages,
+          { role: "user", content: currentUserContent },
         ];
-        const response = await callSmalltalkText({
-          messages: apiMessages,
-          systemPrompt,
-        });
+
+        // 4) LLM-Aufruf und Storage-Upload parallel starten.
+        const uploadPromise: Promise<{ path: string; publicUrl: string } | null> =
+          image ? uploadChatImage(userId, image.blob) : Promise.resolve(null);
+        const [response, uploaded] = await Promise.all([
+          callSmalltalkText({ messages: apiMessages, systemPrompt }),
+          uploadPromise,
+        ]);
         void logUsageFromResponse(userId, response);
+
+        // 5) Falls Upload erfolgreich: image_url in die eben angelegte
+        //    User-Row nachtragen.
+        if (uploaded) {
+          const { error: updErr } = await supabase
+            .from("st_messages")
+            .update({ image_url: uploaded.publicUrl })
+            .eq("id", userRow.id);
+          if (updErr) {
+            console.warn("[smalltalk] image_url update failed", updErr);
+          } else {
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === userRow.id
+                  ? { ...m, image_url: uploaded.publicUrl }
+                  : m,
+              ),
+            );
+          }
+        }
+
         const assistantText = extractAssistantText(response);
         if (assistantText) {
+          const sources = extractSources(response);
           const assistantRow = await insertMessage({
             conversationId: conv.id,
             role: "assistant",
-            content: assistantText,
+            content: serializeAssistantContent(assistantText, sources),
           });
           setMessages((prev) => [...prev, assistantRow]);
         }
         return true;
       } catch (err) {
-        console.error(err);
+        // Detaillierte, sofort lesbare Fehlerausgabe für Diagnosezwecke –
+        // gerade bei 401/upstream-Fehlern spart das den Klick durch die
+        // aufgeklappten `details`-Objekte im DevTools-Object-Inspector.
+        try {
+          console.error(
+            "[smalltalk send] error:",
+            JSON.stringify(err, null, 2),
+          );
+        } catch {
+          console.error("[smalltalk send] error (raw):", err);
+        }
         setError("Senden fehlgeschlagen, versuch's nochmal.");
         return false;
       } finally {
         setIsSending(false);
       }
     },
-    [ensureConversation, messages, systemPrompt],
+    [ensureConversation, messages, systemPrompt, userId],
   );
 
-  async function handleSubmit(e: FormEvent<HTMLFormElement>) {
-    e.preventDefault();
-    if (isSending) return;
-    const value = input;
-    if (!value.trim()) return;
-    const ok = await sendMessage(value);
-    // Eingabetext erst nach erfolgreichem Senden verwerfen – bei
-    // Netzwerk-/Serverfehlern bleibt der Text im Feld, damit der Nutzer
-    // direkt erneut auf Senden klicken kann.
-    if (ok) setInput("");
+  async function handleSubmit(
+    text: string,
+    image: PreparedImage | null,
+  ): Promise<boolean> {
+    if (isSending) return false;
+    return await sendMessage(text, image);
   }
 
   return (
@@ -400,30 +486,15 @@ function SmalltalkChat() {
         </div>
       ) : null}
 
-      <form onSubmit={handleSubmit} className="mt-3 flex items-end gap-2">
-        <textarea
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              void handleSubmit(e as unknown as FormEvent<HTMLFormElement>);
-            }
-          }}
-          rows={1}
-          placeholder="Schreib etwas oder bitte um ein Bild …"
-          className="min-h-10 max-h-40 flex-1 resize-none rounded-lg border border-border bg-bg-elevated px-3 py-2 text-base leading-relaxed outline-none focus:border-accent focus:ring-1 focus:ring-accent disabled:cursor-wait disabled:opacity-70 md:text-sm"
-          disabled={isSending || !ready}
-        />
-        <button
-          type="submit"
-          disabled={isSending || !ready || !input.trim()}
-          className="inline-flex min-h-10 min-w-10 items-center justify-center gap-2 rounded-lg bg-accent px-4 py-2 text-sm font-semibold text-bg transition-colors hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-60"
-        >
-          {isSending ? <Spinner /> : null}
-          <span>Senden</span>
-        </button>
-      </form>
+      <ChatComposer
+        value={input}
+        onChange={setInput}
+        onSubmit={handleSubmit}
+        disabled={isSending}
+        ready={ready}
+        placeholder="Schreib etwas, häng ein Bild an oder bitte um ein Bild …"
+        spinner={<Spinner />}
+      />
 
       {projectDialogOpen && conversation ? (
         <AddToProjectDialog
@@ -452,6 +523,14 @@ function SmalltalkBubble({
   imageUrl: string | null;
 }) {
   const isUser = role === "user";
+  // Bei Assistant-Nachrichten kann ein serialisierter Quellen-Block am
+  // Ende hängen (aus web_search-Zitationen). Wir spalten ihn ab und
+  // rendern die Quellen als kleine, klickbare Link-Liste unter dem Text.
+  const parsed = !isUser
+    ? parseAssistantContent(content)
+    : { text: content, sources: [] as const };
+  const displayText = parsed.text;
+  const sources = parsed.sources;
   return (
     <div className={isUser ? "flex justify-end" : "flex justify-start"}>
       <div
@@ -463,14 +542,28 @@ function SmalltalkBubble({
         ].join(" ")}
       >
         {imageUrl ? (
-          <img
-            src={imageUrl}
-            alt={content || "Generiertes Bild"}
-            className="mb-2 max-w-full rounded-lg"
-            loading="lazy"
-          />
+          <ChatImage url={imageUrl} alt={displayText || "Angehängtes Bild"} />
         ) : null}
-        {content ? <div>{content}</div> : null}
+        {displayText ? <div>{displayText}</div> : null}
+        {sources.length > 0 ? (
+          <div className="mt-2 border-t border-border/60 pt-2 text-xs text-text-muted">
+            <div className="mb-1 font-medium">Quellen:</div>
+            <ol className="list-decimal space-y-0.5 pl-4">
+              {sources.map((s, i) => (
+                <li key={`${s.url}-${i}`} className="break-all">
+                  <a
+                    href={s.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-accent hover:underline"
+                  >
+                    {s.title}
+                  </a>
+                </li>
+              ))}
+            </ol>
+          </div>
+        ) : null}
       </div>
     </div>
   );
@@ -808,10 +901,14 @@ function MyBroChat() {
   );
 
   const persistAndAppend = useCallback(
-    async (role: "user" | "assistant", content: string) => {
+    async (
+      role: "user" | "assistant",
+      content: string,
+      imageUrl: string | null = null,
+    ) => {
       const { data, error: err } = await supabase
         .from("messages")
-        .insert({ user_id: userId, role, content })
+        .insert({ user_id: userId, role, content, image_url: imageUrl })
         .select("*")
         .single();
       if (err || !data) throw err ?? new Error("Insert messages fehlgeschlagen.");
@@ -824,32 +921,83 @@ function MyBroChat() {
   // ---------- Öffentliche Aktionen ----------
 
   const sendUserMessage = useCallback(
-    async (text: string): Promise<boolean> => {
+    async (
+      text: string,
+      image: PreparedImage | null,
+    ): Promise<boolean> => {
       setError(null);
       const trimmed = text.trim();
-      if (!trimmed) return false;
+      // Bild allein (ohne Text) ist erlaubt: Sonnet analysiert das Bild
+      // und antwortet – oder ruft passende Tools auf.
+      if (!trimmed && !image) return false;
       setIsSending(true);
       try {
-        await persistAndAppend("user", trimmed);
+        // 1) User-Row einfügen (image_url wird nachgereicht, sobald der
+        //    Storage-Upload durch ist – der LLM-Call wartet nicht darauf).
+        const userRow = await persistAndAppend("user", trimmed, null);
+
+        // 2) Kompletten Verlauf aus DB neu laden (Trigger-Semantik +
+        //    saubere Reihenfolge inkl. der eben eingefügten Row).
         const { data: latest } = await supabase
           .from("messages")
           .select("*")
           .order("created_at", { ascending: true });
         const convo = dbToApi((latest ?? []) as DbMessage[]);
-        const assistantText = await runAssistantTurn(convo, {
-          profile,
-          archive,
-          challenges,
-          challengeDays,
-          todayIso: todayIso(),
-        });
+
+        // 3) Aktuellen User-Turn ggf. mit Bild-Base64 anreichern.
+        //    Historische Bilder werden bewusst NICHT wieder als Base64
+        //    ins Modell gefüttert – zu teuer und selten nützlich.
+        if (image) {
+          const last = convo[convo.length - 1];
+          if (last && last.role === "user") {
+            convo[convo.length - 1] = {
+              role: "user",
+              content: buildUserContentWithImage(
+                typeof last.content === "string" ? last.content : trimmed,
+                image,
+              ),
+            };
+          }
+        }
+
+        // 4) LLM-Tool-Loop und Storage-Upload parallel starten.
+        const uploadPromise: Promise<{ path: string; publicUrl: string } | null> =
+          image ? uploadChatImage(userId, image.blob) : Promise.resolve(null);
+        const [assistantText, uploaded] = await Promise.all([
+          runAssistantTurn(convo, {
+            profile,
+            archive,
+            challenges,
+            challengeDays,
+            todayIso: todayIso(),
+          }),
+          uploadPromise,
+        ]);
+
+        // 5) image_url in der eben angelegten User-Row nachtragen.
+        if (uploaded) {
+          const { error: updErr } = await supabase
+            .from("messages")
+            .update({ image_url: uploaded.publicUrl })
+            .eq("id", userRow.id);
+          if (updErr) console.warn("[mybro] image_url update failed", updErr);
+        }
+
         if (assistantText) {
-          await persistAndAppend("assistant", assistantText);
+          await persistAndAppend("assistant", assistantText, null);
         }
         await loadMessages();
         return true;
       } catch (err) {
-        console.error(err);
+        // Detaillierte, sofort lesbare Fehlerausgabe für Diagnosezwecke.
+        try {
+          console.error(
+            "[mybro send] error:",
+            JSON.stringify(err, null, 2),
+          );
+        } catch {
+          console.error("[mybro send] error (raw):", err);
+        }
         setError("Senden fehlgeschlagen, versuch's nochmal.");
         return false;
       } finally {
@@ -864,6 +1012,7 @@ function MyBroChat() {
       archive,
       challenges,
       challengeDays,
+      userId,
     ],
   );
 
@@ -987,16 +1136,12 @@ function MyBroChat() {
     [messages],
   );
 
-  async function handleSubmit(e: FormEvent<HTMLFormElement>) {
-    e.preventDefault();
-    if (isSending) return;
-    const value = input;
-    if (!value.trim()) return;
-    const ok = await sendUserMessage(value);
-    // Eingabetext erst nach erfolgreichem Senden verwerfen – bei
-    // Netzwerk-/Serverfehlern bleibt der Text im Feld, damit der Nutzer
-    // direkt erneut auf Senden klicken kann.
-    if (ok) setInput("");
+  async function handleSubmit(
+    text: string,
+    image: PreparedImage | null,
+  ): Promise<boolean> {
+    if (isSending) return false;
+    return await sendUserMessage(text, image);
   }
 
   return (
@@ -1017,7 +1162,12 @@ function MyBroChat() {
         ) : null}
 
         {visibleMessages.map((m) => (
-          <MessageBubble key={m.id} role={m.role} content={m.content} />
+          <MessageBubble
+            key={m.id}
+            role={m.role}
+            content={m.content}
+            imageUrl={m.image_url}
+          />
         ))}
 
         {isSending ? <TypingIndicator /> : null}
@@ -1032,30 +1182,15 @@ function MyBroChat() {
         </div>
       ) : null}
 
-      <form onSubmit={handleSubmit} className="mt-3 flex items-end gap-2">
-        <textarea
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              void handleSubmit(e as unknown as FormEvent<HTMLFormElement>);
-            }
-          }}
-          rows={1}
-          placeholder="Schreib etwas … (Enter = senden, Shift+Enter = neue Zeile)"
-          className="min-h-10 max-h-40 flex-1 resize-none rounded-lg border border-border bg-bg-elevated px-3 py-2 text-base leading-relaxed outline-none focus:border-accent focus:ring-1 focus:ring-accent disabled:cursor-wait disabled:opacity-70 md:text-sm"
-          disabled={isSending || !ready}
-        />
-        <button
-          type="submit"
-          disabled={isSending || !ready || !input.trim()}
-          className="inline-flex min-h-10 min-w-10 items-center justify-center gap-2 rounded-lg bg-accent px-4 py-2 text-sm font-semibold text-bg transition-colors hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-60"
-        >
-          {isSending ? <Spinner /> : null}
-          <span>Senden</span>
-        </button>
-      </form>
+      <ChatComposer
+        value={input}
+        onChange={setInput}
+        onSubmit={handleSubmit}
+        disabled={isSending}
+        ready={ready}
+        placeholder="Schreib etwas oder häng ein Bild an … (Enter = senden, Shift+Enter = neue Zeile)"
+        spinner={<Spinner />}
+      />
     </>
   );
 }
@@ -1065,9 +1200,11 @@ function MyBroChat() {
 function MessageBubble({
   role,
   content,
+  imageUrl,
 }: {
   role: "user" | "assistant";
   content: string;
+  imageUrl: string | null;
 }) {
   const isUser = role === "user";
   return (
@@ -1080,7 +1217,10 @@ function MessageBubble({
             : "rounded-bl-md border border-border bg-bg-elevated text-text",
         ].join(" ")}
       >
-        {content}
+        {imageUrl ? (
+          <ChatImage url={imageUrl} alt={content || "Angehängtes Bild"} />
+        ) : null}
+        {content ? <div>{content}</div> : null}
       </div>
     </div>
   );

@@ -81,7 +81,16 @@ function toOpenAIMessages(
       if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
       out.push(assistantMsg);
     } else {
+      // user-Turn. Kann drei Arten von Blöcken enthalten:
+      //  - text          → in ein Content-Array oder einen einfachen String
+      //  - image (base64)→ als image_url-Part (data-URL) in ein Content-Array
+      //  - tool_result   → als eigene "tool"-Message vor der user-Message
+      //
+      // Enthält der Turn KEIN Bild, bleiben wir beim einfachen
+      // `content: string`-Format (kompatibler mit älteren gpt-Modellen
+      // und ohne unnötigen Overhead).
       const textParts: string[] = [];
+      const imageParts: Array<Record<string, unknown>> = [];
       const toolResultMsgs: Array<Record<string, unknown>> = [];
 
       for (const block of content) {
@@ -89,6 +98,21 @@ function toOpenAIMessages(
         const b = block as Record<string, unknown>;
         if (b.type === "text" && typeof b.text === "string") {
           textParts.push(b.text);
+        } else if (b.type === "image") {
+          const src = b.source as Record<string, unknown> | undefined;
+          if (
+            src &&
+            src.type === "base64" &&
+            typeof src.media_type === "string" &&
+            typeof src.data === "string"
+          ) {
+            imageParts.push({
+              type: "image_url",
+              image_url: {
+                url: `data:${src.media_type};base64,${src.data}`,
+              },
+            });
+          }
         } else if (b.type === "tool_result") {
           const c = b.content;
           const contentStr = typeof c === "string" ? c : JSON.stringify(c);
@@ -101,7 +125,16 @@ function toOpenAIMessages(
       }
 
       for (const trm of toolResultMsgs) out.push(trm);
-      if (textParts.length > 0) {
+
+      if (imageParts.length > 0) {
+        // OpenAI verlangt bei multimodalen Inhalten das Content-Array-Format.
+        const parts: Array<Record<string, unknown>> = [];
+        if (textParts.length > 0) {
+          parts.push({ type: "text", text: textParts.join("") });
+        }
+        for (const ip of imageParts) parts.push(ip);
+        out.push({ role: "user", content: parts });
+      } else if (textParts.length > 0) {
         out.push({ role: "user", content: textParts.join("") });
       }
     }

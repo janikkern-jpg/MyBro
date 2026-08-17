@@ -76,3 +76,11 @@ export function FolderIcon(props: SVGProps<SVGSVGElement>) {
     </svg>
   );
 }
+
+export function PaperclipIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...baseProps} {...props}>
+      <path d="M21 12.5 12.5 21a5 5 0 0 1-7-7L14 5.5a3.5 3.5 0 0 1 5 5L10.5 19a2 2 0 0 1-2.8-2.8L15 9" />
+    </svg>
+  );
+}

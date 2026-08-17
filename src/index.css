@@ -103,8 +103,29 @@
   html[data-keyboard-open="true"] .h-chat-shell {
     --chat-bottom: 0px;
   }
+  /* Bottom-Nav sanft weg-blenden, sobald die Tastatur offen ist –
+     nicht mit `display:none` (das wäre ein hartes Verschwinden),
+     sondern mit Fade + kleiner Slide-Down-Bewegung. Zusätzlich
+     `visibility:hidden` NACH dem Fade, damit iOS/Android nicht mehr
+     versucht, die Nav am oberen Rand der Tastatur andocken zu lassen
+     (das ist genau der Effekt, bei dem sie „mit hochspringt").
+     `pointer-events:none` verhindert versehentliches Antippen. */
+  .mobile-bottom-nav {
+    transition:
+      opacity 180ms ease,
+      transform 180ms ease,
+      visibility 0s linear 180ms;
+    will-change: opacity, transform;
+  }
   html[data-keyboard-open="true"] .mobile-bottom-nav {
+    opacity: 0;
+    transform: translateY(120%);
+    pointer-events: none;
     visibility: hidden;
+    transition:
+      opacity 180ms ease,
+      transform 180ms ease,
+      visibility 0s linear 0s;
   }
   @media (min-width: 768px) {
     /* Desktop: klassischer Flow, keine Fixierung nötig. */

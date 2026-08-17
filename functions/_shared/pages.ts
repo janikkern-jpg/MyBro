@@ -4,6 +4,8 @@
 export type Env = {
   ANTHROPIC_API_KEY?: string;
   OPENAI_API_KEY?: string;
+  // Debug-Toggle: "1" deaktiviert das Web-Search-Tool im Smalltalk-Zweig.
+  SMALLTALK_DISABLE_WEB_SEARCH?: string;
 };
 
 export type PagesContext = {

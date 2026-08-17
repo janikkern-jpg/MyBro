@@ -1,6 +1,8 @@
 // Datentypen für den Smalltalk-Zweig – bewusst getrennt von den
 // MyBro-Typen unter ../types.ts, um beide Modi klar zu isolieren.
 
+import type { ContentBlock } from "../types";
+
 export type SmalltalkRole = "user" | "assistant";
 
 export type SmalltalkPrinciple = {
@@ -37,16 +39,41 @@ export type SmalltalkMessage = {
 };
 
 // Anthropic-Wire-Format (nur die Felder, die der Smalltalk-Endpoint nutzt).
+// content darf entweder ein einfacher String sein (Text-only) ODER
+// ein ContentBlock-Array, wenn ein Bild als Base64-Block angehängt ist.
 export type StApiMessage = {
   role: SmalltalkRole;
-  content: string;
+  content: string | ContentBlock[];
+};
+
+// Zitations-Eintrag aus einem web_search-Ergebnis (Anthropic-Format).
+export type StWebSearchCitation = {
+  type: "web_search_result_location";
+  url?: string;
+  title?: string;
+  cited_text?: string;
+  encrypted_index?: string;
+};
+
+// Text-Block in einer Anthropic-Response kann optional Zitationen tragen,
+// wenn das Modell das Web-Search-Tool genutzt hat.
+export type StResponseTextBlock = {
+  type: "text";
+  text?: string;
+  citations?: StWebSearchCitation[];
 };
 
 export type StChatResponse = {
   id: string;
-  content: Array<{ type: string; text?: string }>;
+  content: Array<StResponseTextBlock | { type: string; text?: string }>;
   model?: string;
   stop_reason?: string | null;
+};
+
+// Kompakte, in `content` persistierbare Quellenangabe.
+export type StSource = {
+  title: string;
+  url: string;
 };
 
 export type StImageResponse = {

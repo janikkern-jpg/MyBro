@@ -7,12 +7,19 @@ import {
 } from "./_shared/anthropic";
 import { callOpenAIText } from "./_shared/openaiText";
 import { selectModelForMessages } from "./_shared/modelRouting";
-import { usageFromAnthropicJson, type UsageRecord } from "./_shared/pricing";
+import {
+  usageForAnthropicWebSearch,
+  usageFromAnthropicJson,
+  type UsageRecord,
+} from "./_shared/pricing";
 
 // Smalltalk-Chat-Endpoint. Eigenständiger Zweig (kein MyBro-Kontext), mit:
 // - gemeinsamem Modell-Routing (haiku/sonnet/opus je nach Komplexität,
 //   siehe _shared/modelRouting.ts) – identisch zur MyBro-Route
 // - OpenAI-Fallback (gpt-5.4) bei dauerhaften 5xx/Netzwerk-Fehlern
+// - Anthropic-eigenem Web-Search-Tool (server-side) für aktuelle Themen
+//   (Preise, Events, News, Öffnungszeiten). Zusätzliche Kosten pro Such-
+//   anfrage werden separat in usage_log geloggt.
 
 type SmalltalkRequestBody = {
   messages: AnthropicMessage[];
@@ -20,6 +27,14 @@ type SmalltalkRequestBody = {
 };
 
 const MAX_TOKENS = 4096;
+
+// max_uses begrenzt die Anzahl Websuchen pro Anfrage – verhindert, dass
+// ein einzelner Turn versehentlich Dutzende Suchen auslöst.
+const WEB_SEARCH_TOOL = {
+  type: "web_search_20250305",
+  name: "web_search",
+  max_uses: 5,
+} as const;
 
 function jsonResponse(
   status: number,
@@ -40,6 +55,41 @@ function errorResponse(status: number, message: string): Response {
   return jsonResponse(status, { error: message });
 }
 
+// Loggt in Netlify-Function-Logs, ob Claude das Web-Search-Tool
+// tatsächlich aufgerufen hat. Nützlich zum Debuggen, wenn erwartete
+// Live-Recherchen ausbleiben (z. B. wegen Prompt, Modell oder Auslastung).
+function logWebSearchTelemetry(
+  providerTag: string,
+  parsed: Record<string, unknown>,
+): void {
+  const content = Array.isArray(parsed.content)
+    ? (parsed.content as Array<Record<string, unknown>>)
+    : [];
+  const serverToolUses = content.filter(
+    (b) => b?.type === "server_tool_use",
+  ).length;
+  const webSearchResults = content.filter(
+    (b) => b?.type === "web_search_tool_result",
+  ).length;
+  let citationCount = 0;
+  for (const b of content) {
+    if (b?.type !== "text") continue;
+    const cits = (b as { citations?: unknown }).citations;
+    if (Array.isArray(cits)) citationCount += cits.length;
+  }
+  const usage = (parsed as { usage?: Record<string, unknown> }).usage ?? {};
+  const requests = Number(
+    (usage as { server_tool_use?: { web_search_requests?: unknown } })
+      .server_tool_use?.web_search_requests ?? 0,
+  );
+  const stopReason = (parsed as { stop_reason?: unknown }).stop_reason;
+  console.log(
+    `[provider=${providerTag}] web_search: requests=${requests} ` +
+      `serverToolUses=${serverToolUses} results=${webSearchResults} ` +
+      `citations=${citationCount} stop_reason=${String(stopReason)}`,
+  );
+}
+
 async function respondFromOutcome(
   outcome: FetchOutcome,
   ctx: {
@@ -55,6 +105,9 @@ async function respondFromOutcome(
       const parsed = JSON.parse(outcome.rawText) as Record<string, unknown>;
       const mainUsage = usageFromAnthropicJson(parsed, ctx.primaryModel);
       if (mainUsage) ctx.usageBucket.push(mainUsage);
+      const webSearchUsage = usageForAnthropicWebSearch(parsed);
+      if (webSearchUsage) ctx.usageBucket.push(webSearchUsage);
+      logWebSearchTelemetry(ctx.providerTag, parsed);
       console.log(`[provider=${ctx.providerTag}] Antwort erfolgreich.`);
       return jsonResponse(200, { ...parsed, _usage: ctx.usageBucket });
     } catch {
@@ -170,16 +223,26 @@ export default async (req: Request, _context: Context): Promise<Response> => {
       ` → models=${selection.models.join("→")}`,
   );
 
-  // Klassifikator + Haupt-Call (+ ggf. OpenAI-Fallback) landen im
-  // usageBucket; der Client persistiert das später in `usage_log`.
   const usageBucket: UsageRecord[] = [];
   if (selection.classifierUsage) usageBucket.push(selection.classifierUsage);
+
+  // Kill-Switch: SMALLTALK_DISABLE_WEB_SEARCH="1" deaktiviert das
+  // Web-Search-Tool komplett (Debug-Hilfe zum Isolieren von 401/tool-
+  // Zugriffsfehlern gegenüber generellen Key-Problemen).
+  const webSearchDisabled = process.env.SMALLTALK_DISABLE_WEB_SEARCH === "1";
 
   // 2. Antwort-Aufruf.
   const anthropicBody: Record<string, unknown> = {
     max_tokens: MAX_TOKENS,
     messages,
   };
+  if (!webSearchDisabled) {
+    anthropicBody.tools = [WEB_SEARCH_TOOL];
+  } else {
+    console.warn(
+      "[smalltalk] SMALLTALK_DISABLE_WEB_SEARCH=1 – web_search-Tool deaktiviert.",
+    );
+  }
   if (typeof systemPrompt === "string" && systemPrompt.length > 0) {
     anthropicBody.system = systemPrompt;
   }

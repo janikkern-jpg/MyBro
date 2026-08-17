@@ -12,7 +12,22 @@ export type ToolResultBlock = {
   content: string;
   is_error?: boolean;
 };
-export type ContentBlock = TextBlock | ToolUseBlock | ToolResultBlock;
+// Bild-Block für Anthropic-Vision (nur Base64, wie in der Doku). Wird
+// von Composer + sendUserMessage in beiden Modi in User-Turns eingefügt,
+// wenn eine Bilddatei angehängt ist.
+export type ImageBlock = {
+  type: "image";
+  source: {
+    type: "base64";
+    media_type: "image/jpeg" | "image/png" | "image/webp" | "image/gif";
+    data: string;
+  };
+};
+export type ContentBlock =
+  | TextBlock
+  | ImageBlock
+  | ToolUseBlock
+  | ToolResultBlock;
 
 export type ApiMessage = {
   role: "user" | "assistant";
@@ -27,6 +42,7 @@ export type DbMessage = {
   user_id: string;
   role: DbRole;
   content: string;
+  image_url: string | null;
   created_at: string;
 };
 

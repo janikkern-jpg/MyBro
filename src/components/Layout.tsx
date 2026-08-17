@@ -31,20 +31,53 @@ export default function Layout() {
       else doc.style.removeProperty("--chat-top");
     };
 
+    // Ist gerade ein Text-Eingabefeld fokussiert? Fokus ist auf iOS/
+    // Android der zuverlässigste Signalgeber für „Tastatur ist offen":
+    // sie fährt IMMER genau dann aus, wenn ein <input>/<textarea>/
+    // contenteditable den Fokus bekommt, und geht mit dessen Blur wieder
+    // runter. Die visualViewport-Heuristik dient nur als Fallback für
+    // ältere Browser bzw. Bluetooth-Tastaturen (dort will man die Nav
+    // sichtbar lassen, weil kein Platz-Konflikt entsteht).
+    const isTextInputFocused = () => {
+      const el = document.activeElement as HTMLElement | null;
+      if (!el) return false;
+      if (el.isContentEditable) return true;
+      const tag = el.tagName;
+      if (tag === "TEXTAREA") return true;
+      if (tag === "INPUT") {
+        const type = (el as HTMLInputElement).type;
+        // File/Button/Checkbox etc. öffnen KEINE Tastatur.
+        const typing = [
+          "text",
+          "search",
+          "email",
+          "url",
+          "tel",
+          "password",
+          "number",
+        ];
+        return typing.includes(type);
+      }
+      return false;
+    };
+
     let raf = 0;
     const applyViewport = () => {
       cancelAnimationFrame(raf);
       raf = requestAnimationFrame(() => {
+        let kb = 0;
         if (vv) {
           doc.style.setProperty("--vvh", `${vv.height}px`);
           doc.style.setProperty("--vvo", `${vv.offsetTop}px`);
-          const kb = Math.max(
-            0,
-            window.innerHeight - vv.height - vv.offsetTop,
-          );
-          if (kb > 100) doc.setAttribute("data-keyboard-open", "true");
-          else doc.removeAttribute("data-keyboard-open");
+          kb = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
         }
+        // Tastatur offen = Fokus in Text-Feld ODER visualViewport
+        // deutlich geschrumpft. Der Fokus-Zweig reagiert sofort (vor
+        // dem vv-resize-Frame), der Höhen-Zweig fängt exotische Fälle
+        // wie externe Software-Keyboards ab.
+        const open = isTextInputFocused() || kb > 150;
+        if (open) doc.setAttribute("data-keyboard-open", "true");
+        else doc.removeAttribute("data-keyboard-open");
         measureHeader();
       });
     };
@@ -61,6 +94,11 @@ export default function Layout() {
     window.addEventListener("orientationchange", applyViewport);
     vv?.addEventListener("resize", applyViewport);
     vv?.addEventListener("scroll", applyViewport);
+    // Fokus-Events feuern nur einmal beim Übergang – dort auch die
+    // sofortige Aktualisierung anstoßen, sonst hängt der Nav-Status
+    // am nächsten Viewport-Resize (auf iOS gerne 200–400 ms später).
+    document.addEventListener("focusin", applyViewport);
+    document.addEventListener("focusout", applyViewport);
 
     return () => {
       cancelAnimationFrame(raf);
@@ -69,6 +107,8 @@ export default function Layout() {
       window.removeEventListener("orientationchange", applyViewport);
       vv?.removeEventListener("resize", applyViewport);
       vv?.removeEventListener("scroll", applyViewport);
+      document.removeEventListener("focusin", applyViewport);
+      document.removeEventListener("focusout", applyViewport);
       doc.style.removeProperty("--vvh");
       doc.style.removeProperty("--vvo");
       doc.style.removeProperty("--chat-top");
