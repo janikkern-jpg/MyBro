@@ -73,9 +73,11 @@ function buildGenerateImageGuidance(): string {
 // Tools-Liste – Claude soll das erkennen und in Textform antworten).
 function buildEditImageGuidance(): string {
   return [
-    "WERKZEUG: Zusätzlich zu `generate_image` kann `edit_image` verfügbar sein. Es verändert das ZULETZT in dieser Unterhaltung angehängte oder erzeugte Bild anhand eines Text-Prompts.",
+    "WERKZEUG: Du hast ein Bild-Bearbeitungs-Tool `edit_image`. Es verändert das ZULETZT in dieser Unterhaltung angehängte oder erzeugte Bild anhand eines Text-Prompts. Das Tool ist nur in der Tools-Liste, wenn es ein solches Referenzbild gibt – das Feature selbst gibt es aber IMMER.",
     "",
-    "Wann `edit_image` statt `generate_image`?",
+    "FÄHIGKEITSAUSSAGE (wichtig!): Wenn der Nutzer allgemein fragt „kannst du Bilder bearbeiten / verändern / bearbeiten dir ein Bild?\" o. ä., antworte klar mit JA – du kannst bestehende Bilder bearbeiten (Objekte hinzufügen/entfernen, Farben ändern, Hintergrund tauschen …). Wenn gerade kein Bild im Gespräch ist, ergänze kurz, dass der Nutzer dazu ein Bild anhängen oder eins von dir generieren lassen soll. Sage NIEMALS „ich kann keine Bilder bearbeiten\" oder „ich kann nur neue Bilder generieren\" – das ist falsch.",
+    "",
+    "Wann `edit_image` statt `generate_image` aufrufen?",
     "- Der Nutzer bezieht sich erkennbar auf ein bestehendes Bild („das Bild\", „dieses Foto\", „darauf\", „hier\").",
     "- Es geht um eine VERÄNDERUNG: „füg X hinzu\", „entferne Y\", „ändere die Farbe\", „mach den Hintergrund unscharf\", „ersetze Z durch …\", „tausche … aus\".",
     "- Für ein komplett NEUES, eigenständiges Bild ohne Bezug zu einem vorhandenen bleibt `generate_image` richtig.",
@@ -84,7 +86,7 @@ function buildEditImageGuidance(): string {
     "- Der `prompt` beschreibt NUR die gewünschte Änderung, nicht das ganze Bild neu.",
     "- Kein `size`-Feld – die Ergebnisgröße orientiert sich am Original.",
     "- Nach erfolgreichem Aufruf wird das veränderte Bild automatisch unter deiner Antwort angezeigt. Ein kurzer Satz reicht (z. B. „So sieht es mit … aus.\").",
-    "- WICHTIG: Wenn `edit_image` in der Tools-Liste FEHLT, obwohl der Nutzer eine Bildbearbeitung möchte, gibt es kein Referenzbild im Verlauf. Rufe dann WEDER `edit_image` NOCH `generate_image` auf, sondern antworte kurz im Chat: dass du kein Bild zum Bearbeiten findest und der Nutzer bitte eins anhängen soll.",
+    "- WICHTIG: Wenn der Nutzer eine KONKRETE Bearbeitung möchte, `edit_image` aber NICHT in der Tools-Liste steht, gibt es kein Referenzbild im Verlauf. Rufe dann WEDER `edit_image` NOCH `generate_image` auf, sondern antworte kurz im Chat: dass du für die Bearbeitung ein Bild brauchst und der Nutzer bitte eins anhängen soll (oder du zuerst eins mit `generate_image` erzeugen kannst).",
     "- Bei einem Fehler-Tool-Result gib den Fehlertext weiter. Bei „Bildbearbeitung noch nicht freigeschaltet – Organization Verification auf platform.openai.com nötig.\" zitiere den Satz wörtlich.",
   ].join("\n");
 }
