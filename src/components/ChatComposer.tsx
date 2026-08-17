@@ -1,5 +1,6 @@
 import {
   useCallback,
+  useEffect,
   useRef,
   useState,
   type ChangeEvent,
@@ -9,7 +10,12 @@ import { CloseIcon, PaperclipIcon } from "./icons";
 import { prepareImageForChat, type PreparedImage } from "../lib/chat/imageUtils";
 
 // Gemeinsamer Composer für MyBro und Smalltalk. Kapselt:
-//  - Textfeld (Enter = senden, Shift+Enter = neue Zeile)
+//  - Textfeld
+//     - Desktop: Enter = senden, Shift+Enter = neue Zeile
+//     - Mobile (Touch + schmale Viewport): Enter = immer neue Zeile,
+//       Senden nur über den Button. Verhindert versehentliches
+//       Abschicken beim Antippen der Enter-Taste der Bildschirm-
+//       Tastatur (die dort meist keine Shift-Modifier bietet).
 //  - Anhang-Icon → verstecktes <input type="file"> mit
 //    accept="image/*" und capture="environment" (Handy: Auswahl
 //    Kamera/Galerie automatisch)
@@ -52,6 +58,7 @@ export function ChatComposer({
   const [imagePending, setImagePending] = useState(false);
   const [imageError, setImageError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const isMobile = useIsMobileComposer();
 
   const clearAttachment = useCallback(() => {
     setImage(null);
@@ -170,6 +177,13 @@ export function ChatComposer({
           value={value}
           onChange={(e) => onChange(e.target.value)}
           onKeyDown={(e) => {
+            // Mobile: Enter fügt IMMER nur eine neue Zeile ein.
+            // Abgesendet wird ausschließlich über den Senden-Button –
+            // sonst würde die virtuelle Tastatur (die auf den meisten
+            // Geräten keinen Shift-Modifier für die Enter-Taste bietet)
+            // Nachrichten versehentlich verschicken, sobald der Nutzer
+            // Absätze setzen will.
+            if (isMobile) return;
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
               void handleSubmit(e as unknown as FormEvent<HTMLFormElement>);
@@ -191,4 +205,30 @@ export function ChatComposer({
       </form>
     </>
   );
+}
+
+// Feature-Detection statt UA-Sniffing: als "mobil" gilt ein Gerät, das
+// gleichzeitig einen groben Pointer hat (Touch als primäre Eingabe) UND
+// eine schmale Viewport-Breite. Grenzwert 768 px entspricht Tailwinds
+// `md`-Breakpoint – oberhalb davon (Tablet im Landscape, Desktop mit
+// Touchscreen) soll das gewohnte Desktop-Verhalten wieder greifen.
+function useIsMobileComposer(): boolean {
+  const query = "(pointer: coarse) and (max-width: 767px)";
+  const [isMobile, setIsMobile] = useState(() => {
+    if (typeof window === "undefined" || !window.matchMedia) return false;
+    return window.matchMedia(query).matches;
+  });
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.matchMedia) return;
+    const mql = window.matchMedia(query);
+    const handler = (e: MediaQueryListEvent) => setIsMobile(e.matches);
+    // aktuellen Wert nochmal synchronisieren, falls zwischen Initial-
+    // Render und Effect etwas gedreht wurde (Orientation-Change).
+    setIsMobile(mql.matches);
+    mql.addEventListener("change", handler);
+    return () => mql.removeEventListener("change", handler);
+  }, [query]);
+
+  return isMobile;
 }
