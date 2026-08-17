@@ -36,6 +36,10 @@ export type SmalltalkMessage = {
   content: string;
   image_url: string | null;
   created_at: string;
+  // Woher stammt die Antwort? Optional – alte Zeilen können NULL sein,
+  // dann zeigt die UI kein Badge.
+  provider?: string | null;
+  model?: string | null;
 };
 
 // Anthropic-Wire-Format (nur die Felder, die der Smalltalk-Endpoint nutzt).
@@ -72,6 +76,12 @@ export type StChatResponse = {
   // `create_file`-Tool aufgerufen hat. Der Client rendert diese Karten
   // unter der Nachricht (nicht als Anhang der User-Nachricht!).
   _files?: StCreatedFile[];
+  // Welcher Anbieter hat geantwortet? Wichtig für das Provider-Badge
+  // – im Fallback-Fall (Anthropic → OpenAI) unterscheidet das Backend
+  // hier explizit, welcher Pfad tatsächlich ausgeliefert hat.
+  _provider?: "anthropic" | "openai";
+  _model?: string | null;
+  _fallback?: boolean;
   // Vom Smalltalk-Endpoint gefüllt, wenn Claude im Tool-Loop das
   // `generate_image`-Tool aufgerufen hat. Enthält bereits die public URL
   // im `chat-images`-Bucket – der Client speichert sie in image_url der

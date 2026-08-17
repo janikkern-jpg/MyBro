@@ -44,6 +44,9 @@ export type DbMessage = {
   content: string;
   image_url: string | null;
   created_at: string;
+  // Antwort-Metadaten (nur bei assistant-Zeilen gesetzt).
+  provider?: string | null;
+  model?: string | null;
 };
 
 export type Profile = {

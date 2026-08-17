@@ -95,7 +95,13 @@ export const onRequestPost: PagesHandler = async ({ request, env }) => {
       const mainUsage = usageFromAnthropicJson(parsed, selection.models[0]);
       if (mainUsage) usageBucket.push(mainUsage);
       console.log("[provider=claude] Antwort erfolgreich.");
-      return jsonResponse(200, { ...parsed, _usage: usageBucket });
+      const model = typeof parsed.model === "string" ? parsed.model : null;
+      return jsonResponse(200, {
+        ...parsed,
+        _usage: usageBucket,
+        _provider: "anthropic",
+        _model: model,
+      });
     } catch {
       console.error("Anthropic-Response konnte nicht als JSON geparst werden.");
     }
@@ -119,9 +125,15 @@ export const onRequestPost: PagesHandler = async ({ request, env }) => {
       if (openAIOutcome.kind === "success") {
         if (openAIOutcome.usage) usageBucket.push(openAIOutcome.usage);
         console.log("[provider=openai-fallback] Antwort erfolgreich.");
+        const shaped = openAIOutcome.anthropicShaped;
+        const model =
+          typeof shaped.model === "string" ? shaped.model : null;
         return jsonResponse(200, {
-          ...openAIOutcome.anthropicShaped,
+          ...shaped,
           _usage: usageBucket,
+          _provider: "openai",
+          _model: model,
+          _fallback: true,
         });
       }
 

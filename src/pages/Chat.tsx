@@ -62,6 +62,7 @@ import type {
 import { ChatComposer } from "../components/ChatComposer";
 import { ChatImage } from "../components/ChatImage";
 import { MarkdownContent } from "../components/MarkdownContent";
+import { ProviderBadge } from "../components/ProviderBadge";
 import {
   uploadChatImage,
   type PreparedImage,
@@ -417,6 +418,10 @@ function SmalltalkChat() {
               role: "assistant",
               content: "",
               imageUrl: result.url,
+              // Bilder kommen immer von OpenAI – unabhängig vom
+              // Fallback-Zustand der Text-Kette.
+              provider: "openai",
+              model: "gpt-image-1",
             });
             setMessages((prev) => [...prev, assistantRow]);
           } catch (imgErr) {
@@ -424,13 +429,12 @@ function SmalltalkChat() {
               imgErr && typeof imgErr === "object" && "message" in imgErr
                 ? String((imgErr as { message: unknown }).message)
                 : "Bild konnte nicht erzeugt werden.";
-            // Fehler landet als eigene Assistant-Nachricht genau dort,
-            // wo sonst das Bild erschienen wäre – kein generischer
-            // Chat-Fehler-Banner am oberen Rand.
             const assistantRow = await insertMessage({
               conversationId: conv.id,
               role: "assistant",
               content: `⚠️ ${message}`,
+              provider: "openai",
+              model: "gpt-image-1",
             });
             setMessages((prev) => [...prev, assistantRow]);
           } finally {
@@ -461,6 +465,8 @@ function SmalltalkChat() {
               role: "assistant",
               content: "",
               imageUrl: result.url,
+              provider: "openai",
+              model: "gpt-image-1",
             });
             setMessages((prev) => [...prev, assistantRow]);
           } catch (imgErr) {
@@ -472,6 +478,8 @@ function SmalltalkChat() {
               conversationId: conv.id,
               role: "assistant",
               content: `⚠️ ${message}`,
+              provider: "openai",
+              model: "gpt-image-1",
             });
             setMessages((prev) => [...prev, assistantRow]);
           } finally {
@@ -499,11 +507,19 @@ function SmalltalkChat() {
           // etablierte "eine Message = ein image_url"-Datenpfad
           // unverändert bleibt.
           const primaryImageUrl = images[0]?.url ?? null;
+          // Provider/Modell aus der Server-Envelope übernehmen. Bei
+          // Zeilen, die über den Text-Kanal ein Bild als _images-Block
+          // enthalten, würde der Text von Anthropic kommen – sonst
+          // vom eingesetzten OpenAI-Fallback. Beides ist korrekt.
+          const provider = response._provider ?? null;
+          const model = response._model ?? null;
           const assistantRow = await insertMessage({
             conversationId: conv.id,
             role: "assistant",
             content: finalContent,
             imageUrl: primaryImageUrl,
+            provider,
+            model,
           });
           setMessages((prev) => [...prev, assistantRow]);
           for (const extra of images.slice(1)) {
@@ -512,6 +528,8 @@ function SmalltalkChat() {
               role: "assistant",
               content: "",
               imageUrl: extra.url,
+              provider,
+              model,
             });
             setMessages((prev) => [...prev, extraRow]);
           }
@@ -587,6 +605,8 @@ function SmalltalkChat() {
             role={m.role}
             content={m.content}
             imageUrl={m.image_url}
+            provider={m.provider ?? null}
+            model={m.model ?? null}
           />
         ))}
 
@@ -637,10 +657,14 @@ function SmalltalkBubble({
   role,
   content,
   imageUrl,
+  provider,
+  model,
 }: {
   role: "user" | "assistant";
   content: string;
   imageUrl: string | null;
+  provider?: string | null;
+  model?: string | null;
 }) {
   const isUser = role === "user";
   // Bei Assistant-Nachrichten können zwei Marker am Ende hängen:
@@ -654,7 +678,7 @@ function SmalltalkBubble({
   const sources = parsed.sources;
   const files = parsed.files;
   return (
-    <div className={isUser ? "flex justify-end" : "flex justify-start"}>
+    <div className={isUser ? "flex justify-end" : "flex items-end justify-start gap-1.5"}>
       <div
         className={[
           "max-w-[85%] break-words rounded-2xl px-4 py-2.5 text-sm leading-relaxed",
@@ -700,6 +724,14 @@ function SmalltalkBubble({
           </div>
         ) : null}
       </div>
+      {!isUser && provider ? (
+        <ProviderBadge
+          provider={provider}
+          model={model}
+          fallback={provider === "openai" && model !== "gpt-image-1"}
+          className="mb-0.5"
+        />
+      ) : null}
     </div>
   );
 }
@@ -1034,7 +1066,11 @@ function MyBroChat() {
     async (
       convo: ApiMessage[],
       promptInput: Parameters<typeof buildSystemPrompt>[0],
-    ): Promise<string> => {
+    ): Promise<{
+      text: string;
+      provider: string | null;
+      model: string | null;
+    }> => {
       const systemPrompt = buildSystemPrompt(promptInput);
 
       let guard = 6;
@@ -1063,7 +1099,15 @@ function MyBroChat() {
             .map((b) => b.text)
             .join("\n\n")
             .trim();
-          return text;
+          // Anbieter/Modell für die persistierte Assistant-Zeile
+          // aus der finalen Envelope entnehmen. `_model` kommt bei
+          // Anthropic direkt aus dem Response, beim OpenAI-Fallback
+          // vom Server gesetzt.
+          return {
+            text,
+            provider: response._provider ?? null,
+            model: response._model ?? response.model ?? null,
+          };
         }
 
         // Assistant-Turn mit Tool-Blöcken in den Verlauf aufnehmen (in-memory).
@@ -1085,7 +1129,7 @@ function MyBroChat() {
 
       throw new Error("Tool-Loop-Limit erreicht.");
     },
-    [toolContext],
+    [toolContext, userId],
   );
 
   const persistAndAppend = useCallback(
@@ -1093,10 +1137,19 @@ function MyBroChat() {
       role: "user" | "assistant",
       content: string,
       imageUrl: string | null = null,
+      provider: string | null = null,
+      model: string | null = null,
     ) => {
       const { data, error: err } = await supabase
         .from("messages")
-        .insert({ user_id: userId, role, content, image_url: imageUrl })
+        .insert({
+          user_id: userId,
+          role,
+          content,
+          image_url: imageUrl,
+          provider,
+          model,
+        })
         .select("*")
         .single();
       if (err || !data) throw err ?? new Error("Insert messages fehlgeschlagen.");
@@ -1151,7 +1204,7 @@ function MyBroChat() {
         // 4) LLM-Tool-Loop und Storage-Upload parallel starten.
         const uploadPromise: Promise<{ path: string; publicUrl: string } | null> =
           image ? uploadChatImage(userId, image.blob) : Promise.resolve(null);
-        const [assistantText, uploaded] = await Promise.all([
+        const [assistantTurn, uploaded] = await Promise.all([
           runAssistantTurn(convo, {
             profile,
             archive,
@@ -1171,8 +1224,14 @@ function MyBroChat() {
           if (updErr) console.warn("[mybro] image_url update failed", updErr);
         }
 
-        if (assistantText) {
-          await persistAndAppend("assistant", assistantText, null);
+        if (assistantTurn.text) {
+          await persistAndAppend(
+            "assistant",
+            assistantTurn.text,
+            null,
+            assistantTurn.provider,
+            assistantTurn.model,
+          );
         }
         await loadMessages();
         return true;
@@ -1289,15 +1348,21 @@ function MyBroChat() {
               ...dbToApi(loadedMsgs),
               { role: "user", content: triggerText },
             ];
-            const assistantText = await runAssistantTurn(convo, {
+            const assistantTurn = await runAssistantTurn(convo, {
               profile: loadedProfile,
               archive: loadedArchive,
               challenges: loadedChallenges,
               challengeDays: loadedChallengeDays,
               todayIso: todayIso(),
             });
-            if (assistantText) {
-              await persistAndAppend("assistant", assistantText);
+            if (assistantTurn.text) {
+              await persistAndAppend(
+                "assistant",
+                assistantTurn.text,
+                null,
+                assistantTurn.provider,
+                assistantTurn.model,
+              );
             }
             await loadMessages();
           } finally {
@@ -1355,6 +1420,8 @@ function MyBroChat() {
             role={m.role}
             content={m.content}
             imageUrl={m.image_url}
+            provider={m.provider ?? null}
+            model={m.model ?? null}
           />
         ))}
 
@@ -1389,14 +1456,18 @@ function MessageBubble({
   role,
   content,
   imageUrl,
+  provider,
+  model,
 }: {
   role: "user" | "assistant";
   content: string;
   imageUrl: string | null;
+  provider?: string | null;
+  model?: string | null;
 }) {
   const isUser = role === "user";
   return (
-    <div className={isUser ? "flex justify-end" : "flex justify-start"}>
+    <div className={isUser ? "flex justify-end" : "flex items-end justify-start gap-1.5"}>
       <div
         className={[
           "max-w-[85%] break-words rounded-2xl px-4 py-2.5 text-sm leading-relaxed",
@@ -1412,6 +1483,14 @@ function MessageBubble({
           isUser ? <div>{content}</div> : <MarkdownContent text={content} />
         ) : null}
       </div>
+      {!isUser && provider ? (
+        <ProviderBadge
+          provider={provider}
+          model={model}
+          fallback={provider === "openai" && model !== "gpt-image-1"}
+          className="mb-0.5"
+        />
+      ) : null}
     </div>
   );
 }

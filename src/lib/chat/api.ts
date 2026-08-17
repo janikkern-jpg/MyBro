@@ -7,6 +7,12 @@ export type AnthropicResponse = {
   content: ContentBlock[];
   stop_reason: string | null;
   model: string;
+  // Server-Envelope: welcher Anbieter hat tatsächlich geantwortet?
+  // Wichtig für den Cross-Provider-Fallback (Anthropic → OpenAI) und
+  // das Provider-Badge in der UI.
+  _provider?: "anthropic" | "openai";
+  _model?: string | null;
+  _fallback?: boolean;
 };
 
 export type ChatApiError = {

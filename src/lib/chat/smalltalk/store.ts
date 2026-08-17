@@ -84,6 +84,11 @@ export async function insertMessage(params: {
   role: SmalltalkRole;
   content: string;
   imageUrl?: string | null;
+  // Antwort-Metadaten – nur für assistant-Zeilen relevant. `provider`
+  // ist bewusst offen typisiert, damit später weitere Anbieter dazu
+  // können, ohne die Signatur zu brechen.
+  provider?: string | null;
+  model?: string | null;
 }): Promise<SmalltalkMessage> {
   const { data, error } = await supabase
     .from("st_messages")
@@ -92,6 +97,8 @@ export async function insertMessage(params: {
       role: params.role,
       content: params.content,
       image_url: params.imageUrl ?? null,
+      provider: params.provider ?? null,
+      model: params.model ?? null,
     })
     .select("*")
     .single();

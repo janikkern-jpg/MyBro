@@ -329,10 +329,13 @@ async function respondFromOutcome(
     try {
       const parsed = JSON.parse(outcome.rawText) as Record<string, unknown>;
       console.log(`[provider=${ctx.providerTag}] Antwort erfolgreich.`);
+      const model = typeof parsed.model === "string" ? parsed.model : null;
       return jsonResponse(200, {
         ...parsed,
         _usage: ctx.usageBucket,
         _files: ctx.createdFiles,
+        _provider: "anthropic",
+        _model: model,
       });
     } catch {
       console.error("Anthropic-Response konnte nicht als JSON geparst werden.");
@@ -357,10 +360,16 @@ async function respondFromOutcome(
       if (openAIOutcome.kind === "success") {
         if (openAIOutcome.usage) ctx.usageBucket.push(openAIOutcome.usage);
         console.log("[provider=openai-fallback] Antwort erfolgreich.");
+        const shaped = openAIOutcome.anthropicShaped;
+        const model =
+          typeof shaped.model === "string" ? shaped.model : null;
         return jsonResponse(200, {
-          ...openAIOutcome.anthropicShaped,
+          ...shaped,
           _usage: ctx.usageBucket,
           _files: ctx.createdFiles,
+          _provider: "openai",
+          _model: model,
+          _fallback: true,
         });
       }
 
