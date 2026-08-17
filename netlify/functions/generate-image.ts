@@ -62,6 +62,9 @@ export default async (req: Request, _context: Context): Promise<Response> => {
 
   const openAIKey = process.env.OPENAI_API_KEY;
   if (!openAIKey) {
+    console.error(
+      "[generate-image] fehlt: OPENAI_API_KEY (Netlify > Site settings > Environment variables).",
+    );
     return errorResponse(
       500,
       "OPENAI_API_KEY ist serverseitig nicht konfiguriert.",
@@ -69,10 +72,22 @@ export default async (req: Request, _context: Context): Promise<Response> => {
   }
   const supabaseUrl = process.env.SUPABASE_URL || "";
   const supabaseAnonKey = process.env.SUPABASE_ANON_KEY || "";
-  if (!supabaseUrl || !supabaseAnonKey) {
+  // Wichtig: die serverseitigen Namen SIND `SUPABASE_URL` /
+  // `SUPABASE_ANON_KEY` (NICHT die VITE_-Varianten). Bitte identische
+  // Werte wie die VITE_-Variablen unter Netlify > Site settings >
+  // Environment variables hinterlegen.
+  const missing: string[] = [];
+  if (!supabaseUrl) missing.push("SUPABASE_URL");
+  if (!supabaseAnonKey) missing.push("SUPABASE_ANON_KEY");
+  if (missing.length > 0) {
+    console.error(
+      `[generate-image] fehlt: ${missing.join(", ")} (Netlify > Site settings > Environment variables).`,
+    );
     return errorResponse(
       500,
-      "SUPABASE_URL / SUPABASE_ANON_KEY sind serverseitig nicht konfiguriert.",
+      `Serverseitige Supabase-Konfiguration unvollständig: ${missing.join(", ")}` +
+        " ist/sind in den Netlify-Environment-Variablen nicht gesetzt." +
+        " Bitte in Site settings > Environment variables ergänzen (gleiche Werte wie die VITE_-Variablen, aber ohne VITE_-Prefix).",
     );
   }
 
