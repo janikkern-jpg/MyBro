@@ -72,6 +72,11 @@ export type StChatResponse = {
   // `create_file`-Tool aufgerufen hat. Der Client rendert diese Karten
   // unter der Nachricht (nicht als Anhang der User-Nachricht!).
   _files?: StCreatedFile[];
+  // Vom Smalltalk-Endpoint gefüllt, wenn Claude im Tool-Loop das
+  // `generate_image`-Tool aufgerufen hat. Enthält bereits die public URL
+  // im `chat-images`-Bucket – der Client speichert sie in image_url der
+  // Assistant-Nachricht und rendert sie mit ChatImage.
+  _images?: StGeneratedImage[];
 };
 
 // Kompakte, in `content` persistierbare Quellenangabe.
@@ -87,6 +92,14 @@ export type StCreatedFile = {
   url: string;
   path: string;
   size_bytes: number;
+};
+
+// Vom Server via generate_image erzeugtes Bild (siehe generateImage.ts).
+export type StGeneratedImage = {
+  prompt: string;
+  size: string;
+  url: string;
+  path: string;
 };
 
 export type StImageResponse = {

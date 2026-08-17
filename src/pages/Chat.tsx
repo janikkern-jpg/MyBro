@@ -28,16 +28,15 @@ import {
   type ToolUseBlock,
 } from "../lib/chat/types";
 import {
-  callSmalltalkImage,
   callSmalltalkText,
   extractAssistantText,
   extractFiles,
+  extractImages,
   extractSources,
   parseAssistantContent,
   serializeAssistantContent,
   serializeFilesInto,
 } from "../lib/chat/smalltalk/api";
-import { detectImageIntent, extractImagePrompt } from "../lib/chat/smalltalk/intent";
 import { buildSmalltalkSystemPrompt } from "../lib/chat/smalltalk/systemPrompt";
 import { logUsageFromResponse } from "../lib/usage";
 import {
@@ -330,23 +329,10 @@ function SmalltalkChat() {
         });
         setMessages((prev) => [...prev, userRow]);
 
-        // 2) Bei Bild-Attachment NIEMALS DALL-E anstoßen – der User
-        //    schickt ein Foto zur Analyse, nicht als Text-Prompt für
-        //    Bildgenerierung.
-        if (!image && detectImageIntent(trimmed)) {
-          const imagePrompt = extractImagePrompt(trimmed);
-          const imgResp = await callSmalltalkImage({ prompt: imagePrompt });
-          void logUsageFromResponse(userId, imgResp);
-          const { imageUrl } = imgResp;
-          const assistantRow = await insertMessage({
-            conversationId: conv.id,
-            role: "assistant",
-            content: `Hier ist das Bild zu: „${imagePrompt}"`,
-            imageUrl,
-          });
-          setMessages((prev) => [...prev, assistantRow]);
-          return true;
-        }
+        // Bildwünsche werden NICHT mehr client-seitig per Stichwort-
+        // heuristik abgefangen – Claude entscheidet über den Tool-Aufruf
+        // `generate_image` selbst und wir bekommen das Ergebnis unten in
+        // `response._images` zurück.
 
         // 3) API-Verlauf bauen. Historische Bilder werden nicht erneut
         //    als Base64 nachgeladen – nur das AKTUELLE User-Turn-Bild
@@ -394,20 +380,40 @@ function SmalltalkChat() {
         }
 
         const assistantText = extractAssistantText(response);
-        if (assistantText || (response._files && response._files.length > 0)) {
-          const sources = extractSources(response);
-          const files = extractFiles(response);
+        const sources = extractSources(response);
+        const files = extractFiles(response);
+        const images = extractImages(response);
+        const hasSomething =
+          assistantText.length > 0 ||
+          files.length > 0 ||
+          images.length > 0;
+        if (hasSomething) {
           const withSources = serializeAssistantContent(
             assistantText,
             sources,
           );
           const finalContent = serializeFilesInto(withSources, files);
+          // Erstes Bild in image_url der Nachricht speichern; weitere
+          // Bilder (selten) landen in Folge-Nachrichten, damit der bereits
+          // etablierte "eine Message = ein image_url"-Datenpfad
+          // unverändert bleibt.
+          const primaryImageUrl = images[0]?.url ?? null;
           const assistantRow = await insertMessage({
             conversationId: conv.id,
             role: "assistant",
             content: finalContent,
+            imageUrl: primaryImageUrl,
           });
           setMessages((prev) => [...prev, assistantRow]);
+          for (const extra of images.slice(1)) {
+            const extraRow = await insertMessage({
+              conversationId: conv.id,
+              role: "assistant",
+              content: "",
+              imageUrl: extra.url,
+            });
+            setMessages((prev) => [...prev, extraRow]);
+          }
         }
         return true;
       } catch (err) {

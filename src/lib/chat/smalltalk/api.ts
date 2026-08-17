@@ -2,6 +2,7 @@ import type {
   StApiMessage,
   StChatResponse,
   StCreatedFile,
+  StGeneratedImage,
   StImageResponse,
   StResponseTextBlock,
   StSource,
@@ -230,6 +231,32 @@ export function extractFiles(resp: StChatResponse): StCreatedFile[] {
       url,
       path: typeof f.path === "string" ? f.path : "",
       size_bytes: Number.isFinite(size) ? Math.max(0, size) : 0,
+    });
+  }
+  return out;
+}
+
+/**
+ * Extrahiert die vom Server erzeugten Bilder (`_images`). Analog zu
+ * `extractFiles`. Dedupliziert nach URL.
+ */
+export function extractImages(resp: StChatResponse): StGeneratedImage[] {
+  const raw = Array.isArray(resp._images) ? resp._images : [];
+  const seen = new Set<string>();
+  const out: StGeneratedImage[] = [];
+  for (const im of raw) {
+    if (!im || typeof im !== "object") continue;
+    const url = typeof im.url === "string" ? im.url.trim() : "";
+    const prompt = typeof im.prompt === "string" ? im.prompt : "";
+    const size = typeof im.size === "string" ? im.size : "";
+    if (!url) continue;
+    if (seen.has(url)) continue;
+    seen.add(url);
+    out.push({
+      prompt,
+      size,
+      url,
+      path: typeof im.path === "string" ? im.path : "",
     });
   }
   return out;
