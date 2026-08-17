@@ -162,6 +162,11 @@ export async function generateImageFromToolInput(
         prompt,
         size,
         n: 1,
+        // `quality: "low"` kürzt die Generierungszeit auf ~5–12 s
+        // statt 20–40 s, damit die Antwort ins 26-s-Sync-Fenster
+        // von Netlify Functions passt. Die Qualität reicht für die
+        // Chat-Vorschau in aller Regel absolut aus.
+        quality: "low",
       }),
     });
   } catch (err) {

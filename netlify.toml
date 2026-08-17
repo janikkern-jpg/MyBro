@@ -10,6 +10,13 @@
 [functions]
   node_bundler = "esbuild"
 
+# gpt-image-1 kann pro Bild 15–25 s brauchen; Standard-Sync-Timeout
+# (10 s) reicht dafür nicht → auf das Sync-Maximum von 26 s heben.
+# Achtung: Dieses Maximum steht nur auf bezahlten Plänen zur
+# Verfügung. Auf Free wird Netlify weiterhin bei 10 s abschneiden.
+[functions."generate-image"]
+  timeout = 26
+
 # Kurzer Alias für den Chat-Endpunkt.
 [[redirects]]
   from = "/api/chat"
