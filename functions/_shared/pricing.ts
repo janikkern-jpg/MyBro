@@ -24,12 +24,38 @@ export const PRICING: Record<string, { input: number; output: number }> = {
   "claude-opus-4-8": { input: 5, output: 25 },
   "gpt-5.4": { input: 2.5, output: 15 },
   "gpt-image-1": { input: 5, output: 40 },
+  // Sprachmodus – siehe Konstanten oben.
+  "gpt-4o-mini-tts": { input: 0.6, output: 12 },
 };
 
 // Anthropic Web-Search (server-side tool): USD pro Suchanfrage.
 // Referenz: https://docs.anthropic.com/... – 10 USD / 1000 Suchen.
 export const WEB_SEARCH_MODEL = "web_search_20250305";
 export const WEB_SEARCH_USD_PER_REQUEST = 0.01;
+
+// Sprachmodus – Whisper (Transkription).
+// Referenz (Stand: OpenAI Pricing "Transcription models"):
+// Whisper wird pauschal pro Audio-Minute abgerechnet. Wir loggen 0
+// Tokens, weil die API keine Tokens meldet – die Kosten kommen
+// vollständig aus der Audiodauer.
+export const WHISPER_MODEL = "whisper-1";
+export const WHISPER_USD_PER_MINUTE = 0.006;
+
+// Sprachmodus – TTS (gpt-4o-mini-tts).
+// Offiziell staffelt OpenAI die Kosten in Text-Input-Tokens
+// ($0.60 / 1M Tokens) und Audio-Output-Tokens ($12.00 / 1M Tokens),
+// aber der Speech-Endpoint gibt weder Token-Zahlen noch Audio-Dauer
+// zurück. Wir approximieren:
+//   - Input-Tokens ≈ Zeichen / 4 (übliche Faustregel Deutsch/Englisch)
+//   - Output-Audio-Tokens ≈ Zeichen × 5 (grobe Schätzung: bei
+//     ~150 WPM und ~12.5 Audio-Tokens/s ergibt sich ca. 5 Tokens pro
+//     Textzeichen – hinreichend für Kostenüberblick, nicht für
+//     Buchhaltung).
+// Preise als USD pro 1M Tokens; siehe PRICING-Eintrag unten.
+export const TTS_MODEL = "gpt-4o-mini-tts";
+export const TTS_DEFAULT_VOICE = "onyx";
+const TTS_INPUT_TOKENS_PER_CHAR = 1 / 4;
+const TTS_OUTPUT_TOKENS_PER_CHAR = 5;
 
 export type UsageRecord = {
   provider: Provider;
@@ -182,4 +208,39 @@ export function usageFromOpenAIImageJson(
   const output = Number(usage.output_tokens ?? 0);
   const model = typeof obj.model === "string" ? obj.model : fallbackModel;
   return toRecord("openai", model, input, output);
+}
+
+/**
+ * Whisper wird pro Audio-Minute abgerechnet. Wir loggen 0 Tokens und
+ * die reine Zeit-basierte Kostenschätzung, damit der Voice-Modus im
+ * usage_log getrennt sichtbar bleibt.
+ */
+export function usageForWhisper(durationSeconds: number): UsageRecord | null {
+  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) return null;
+  const minutes = durationSeconds / 60;
+  const cost =
+    Math.round(minutes * WHISPER_USD_PER_MINUTE * 1_000_000) / 1_000_000;
+  return {
+    provider: "openai",
+    model: WHISPER_MODEL,
+    input_tokens: 0,
+    output_tokens: 0,
+    estimated_cost_usd: cost,
+  };
+}
+
+/**
+ * TTS (gpt-4o-mini-tts): näherungsweise Umrechnung Text-Zeichen →
+ * Tokens (siehe Kommentare zu TTS_*_TOKENS_PER_CHAR). Der Speech-
+ * Endpoint liefert keine Usage-Header, daher approximieren wir.
+ */
+export function usageForTts(text: string): UsageRecord | null {
+  const chars = typeof text === "string" ? text.length : 0;
+  if (chars <= 0) return null;
+  const inputTokens = Math.max(1, Math.round(chars * TTS_INPUT_TOKENS_PER_CHAR));
+  const outputTokens = Math.max(
+    1,
+    Math.round(chars * TTS_OUTPUT_TOKENS_PER_CHAR),
+  );
+  return toRecord("openai", TTS_MODEL, inputTokens, outputTokens);
 }

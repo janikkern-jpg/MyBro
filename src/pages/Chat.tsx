@@ -63,6 +63,8 @@ import { ChatComposer } from "../components/ChatComposer";
 import { ChatImage } from "../components/ChatImage";
 import { MarkdownContent } from "../components/MarkdownContent";
 import { ProviderBadge } from "../components/ProviderBadge";
+import { VoiceOverlay } from "../components/VoiceOverlay";
+import { MicIcon } from "../components/icons";
 import {
   uploadChatImage,
   type PreparedImage,
@@ -999,6 +1001,7 @@ function MyBroChat() {
   const [isSending, setIsSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
+  const [voiceOpen, setVoiceOpen] = useState(false);
 
   const bootRef = useRef(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -1263,6 +1266,70 @@ function MyBroChat() {
     ],
   );
 
+  // Voice-Modus: nimmt bereits transkribierten Text entgegen, führt
+  // denselben LLM-Turn wie sendUserMessage aus (ohne Bildpfad) und
+  // gibt die textuelle Assistenz-Antwort zurück, damit der Overlay sie
+  // per TTS abspielen kann. Die Nachrichten werden dabei ganz normal in
+  // den bestehenden MyBro-Chatverlauf geschrieben.
+  const sendVoiceMessage = useCallback(
+    async (transcript: string): Promise<string | null> => {
+      const trimmed = transcript.trim();
+      if (!trimmed) return null;
+      setError(null);
+      setIsSending(true);
+      try {
+        await persistAndAppend("user", trimmed, null);
+        const { data: latest } = await supabase
+          .from("messages")
+          .select("*")
+          .order("created_at", { ascending: true });
+        const convo = dbToApi((latest ?? []) as DbMessage[]);
+        const assistantTurn = await runAssistantTurn(convo, {
+          profile,
+          archive,
+          challenges,
+          challengeDays,
+          todayIso: todayIso(),
+        });
+        if (assistantTurn.text) {
+          await persistAndAppend(
+            "assistant",
+            assistantTurn.text,
+            null,
+            assistantTurn.provider,
+            assistantTurn.model,
+          );
+        }
+        await loadMessages();
+        return assistantTurn.text || null;
+      } catch (err) {
+        try {
+          console.error(
+            "[mybro voice] error:",
+            JSON.stringify(err, null, 2),
+          );
+        } catch {
+          console.error("[mybro voice] error (raw):", err);
+        }
+        // Der Overlay zeigt eine ruhige Fehlermeldung – hier keinen
+        // globalen Chat-Fehler-Banner setzen, damit der Text-Chat im
+        // Hintergrund nicht rot blinkt.
+        throw err;
+      } finally {
+        setIsSending(false);
+      }
+    },
+    [
+      persistAndAppend,
+      runAssistantTurn,
+      loadMessages,
+      profile,
+      archive,
+      challenges,
+      challengeDays,
+    ],
+  );
+
   // ---------- Initialisierung ----------
 
   useEffect(() => {
@@ -1437,6 +1504,20 @@ function MyBroChat() {
         </div>
       ) : null}
 
+      <div className="mt-3 flex justify-end">
+        <button
+          type="button"
+          onClick={() => setVoiceOpen(true)}
+          disabled={!ready}
+          aria-label="Sprachmodus öffnen"
+          title="Sprachmodus öffnen"
+          className="inline-flex min-h-9 items-center gap-2 rounded-full border border-accent/40 bg-accent/10 px-3 py-1.5 text-xs font-medium text-accent transition-colors hover:bg-accent/20 disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          <MicIcon className="h-4 w-4" />
+          <span>Sprachmodus</span>
+        </button>
+      </div>
+
       <ChatComposer
         value={input}
         onChange={setInput}
@@ -1445,6 +1526,13 @@ function MyBroChat() {
         ready={ready}
         placeholder="Schreib etwas oder häng ein Bild an … (Enter = senden, Shift+Enter = neue Zeile)"
         spinner={<Spinner />}
+      />
+
+      <VoiceOverlay
+        open={voiceOpen}
+        onClose={() => setVoiceOpen(false)}
+        onTurn={sendVoiceMessage}
+        userId={userId}
       />
     </>
   );
