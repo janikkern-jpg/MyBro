@@ -4,23 +4,20 @@ import {
   useRef,
   useState,
 } from "react";
-import { CloseIcon, MicIcon } from "./icons";
+import { CloseIcon } from "./icons";
 import { speakText, transcribeAudio, type VoiceApiError } from "../lib/chat/voice/api";
 import { logUsage, type UsageEntry } from "../lib/usage";
 
 // Sprachmodus für MyBro.
 //
-// Vollbild-Overlay mit
-// - großem, audio-reaktivem Kreis (Canvas), der beim Zuhören auf den
-//   Mikrofon-Pegel und beim Sprechen auf den TTS-Playback-Pegel reagiert
-// - Tap-to-talk-Bedienung (einmal antippen = Aufnahme, nochmal = senden)
-// - klarem Zustandstext ("Ich höre zu", "Denke nach", …)
-// - Fehlermeldungen statt stillem Hängenbleiben
-//
-// Der übergeordnete MyBroChat übergibt via `onTurn` eine Callback, die
-// den transkribierten Text als reguläre Nutzernachricht persistiert,
-// den LLM-Turn ausführt und die textuelle Antwort zurückgibt – so
-// bleibt der komplette Sprachdialog Teil des normalen Chatverlaufs.
+// Bedienung:
+// - Antippen startet die Aufnahme.
+// - Automatische Sprachpausenerkennung (VAD): sobald ca. 1,6 s Stille
+//   auf mindestens 300 ms echte Sprache folgen, wird gestoppt +
+//   automatisch gesendet.
+// - Erneutes Antippen während einer Aufnahme wirkt als Notfall-Stopp.
+// - Ein transkribierter Text durchläuft weiterhin den normalen
+//   Chat-Turn (persistiert als Nachricht, LLM-Antwort, TTS-Playback).
 
 export type VoiceOverlayProps = {
   open: boolean;
@@ -38,18 +35,21 @@ type Status =
   | "error";
 
 const STATUS_TEXT: Record<Status, string> = {
-  idle: "Antippen, um zu sprechen",
-  recording: "Ich höre zu … (nochmal antippen zum Senden)",
-  transcribing: "Verstehe …",
-  thinking: "Denke nach …",
-  speaking: "Antworte …",
-  error: "Etwas ist schiefgelaufen.",
+  idle: "Bereit",
+  recording: "Hört zu…",
+  transcribing: "Verstehe…",
+  thinking: "Denkt nach…",
+  speaking: "Antwortet…",
+  error: "Fehler",
 };
 
-const ACCENT_BRIGHT = "#e8c14a";
+// VAD-Parameter (Voice Activity Detection).
+const VOICE_LEVEL_THRESHOLD = 0.035; // gemittelter Analyser-Level > diesem = Sprache
+const SILENCE_HOLD_MS = 1600;         // so lange Stille = Aufnahme beenden
+const MIN_VOICE_MS = 300;             // erst nach so viel echter Sprache greift VAD
+const MAX_RECORDING_MS = 30_000;      // Not-Aus falls VAD versagt
 
-// Bevorzugte Audio-MIME-Types für MediaRecorder. Der erste vom Browser
-// unterstützte gewinnt; leerer String = Browser-Default.
+// Bevorzugte Audio-MIME-Types für MediaRecorder.
 const MIME_CANDIDATES = [
   "audio/webm;codecs=opus",
   "audio/webm",
@@ -80,12 +80,23 @@ function pickMimeType(): string {
 
 function userFriendlyError(err: unknown): string {
   if (!err) return "Unbekannter Fehler.";
-  const anyErr = err as { name?: string; message?: string; status?: number };
-  if (anyErr?.name === "NotAllowedError" || anyErr?.name === "SecurityError") {
+  const anyErr = err as {
+    name?: string;
+    message?: string;
+    status?: number;
+  };
+  // Bewusst NUR echter Permission-Fehler mappt auf "verweigert" — kein
+  // SecurityError, kein InvalidStateError, weil diese in der Praxis
+  // andere Ursachen haben (AudioContext-Race, doppelter Node-Graph)
+  // und der Nutzer sonst denkt, er hätte die Erlaubnis versaut.
+  if (anyErr?.name === "NotAllowedError" || anyErr?.name === "PermissionDeniedError") {
     return "Mikrofonzugriff wurde verweigert. Bitte in den Browser-Einstellungen erlauben und erneut versuchen.";
   }
   if (anyErr?.name === "NotFoundError" || anyErr?.name === "OverconstrainedError") {
     return "Kein passendes Mikrofon gefunden.";
+  }
+  if (anyErr?.name === "NotReadableError") {
+    return "Mikrofon ist gerade blockiert (nutzt es eine andere App?). Bitte erneut versuchen.";
   }
   if (typeof anyErr?.message === "string" && anyErr.message.length > 0) {
     return anyErr.message;
@@ -100,6 +111,33 @@ function userFriendlyError(err: unknown): string {
   }
 }
 
+// Farben (Messing-Akzent wie im Rest von MyBro).
+const ACCENT = "#c9a227";
+const ACCENT_BRIGHT = "#e8c14a";
+const ACCENT_SOFT = "rgba(232, 193, 74, 0.35)";
+
+type Particle = {
+  angle: number;
+  radius: number;
+  speed: number;
+  size: number;
+  alpha: number;
+};
+
+function createParticles(): Particle[] {
+  const arr: Particle[] = [];
+  for (let i = 0; i < 24; i++) {
+    arr.push({
+      angle: Math.random() * Math.PI * 2,
+      radius: 90 + Math.random() * 40,
+      speed: 0.15 + Math.random() * 0.3,
+      size: 0.6 + Math.random() * 1.2,
+      alpha: 0.2 + Math.random() * 0.5,
+    });
+  }
+  return arr;
+}
+
 export function VoiceOverlay({
   open,
   onClose,
@@ -109,8 +147,8 @@ export function VoiceOverlay({
   const [status, setStatus] = useState<Status>("idle");
   const [error, setError] = useState<string | null>(null);
 
-  // Refs für Web-Audio / MediaRecorder-State, damit RAF-Callbacks nicht
-  // gegen React-State-Closures kämpfen.
+  // Refs für Web-Audio / Recorder-State (RAF darf nicht gegen
+  // React-State-Closures kämpfen).
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
@@ -118,6 +156,7 @@ export function VoiceOverlay({
   const rafRef = useRef<number | null>(null);
   const smoothedLevelRef = useRef(0);
   const statusRef = useRef<Status>("idle");
+  const particlesRef = useRef<Particle[]>(createParticles());
 
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -125,19 +164,22 @@ export function VoiceOverlay({
   const recordingStartRef = useRef<number>(0);
   const recordingMimeRef = useRef<string>("");
 
+  // VAD-State.
+  const voiceStartedAtRef = useRef<number>(0); // Zeitpunkt, ab dem Sprache erkannt wurde
+  const lastVoiceAtRef = useRef<number>(0);    // letzter Zeitpunkt mit Level > THRESHOLD
+  const autoStopTriggeredRef = useRef<boolean>(false);
+
   const audioElementRef = useRef<HTMLAudioElement | null>(null);
   const audioSourceNodeRef = useRef<MediaElementAudioSourceNode | null>(null);
-  const currentAudioUrlRef = useRef<string | null>(null);
   const currentAudioRevokeRef = useRef<(() => void) | null>(null);
 
   const cancelledRef = useRef(false);
 
-  // Halte statusRef synchron, damit RAF-Callbacks den aktuellen
-  // Zustand kennen ohne re-registrieren zu müssen.
   useEffect(() => {
     statusRef.current = status;
   }, [status]);
 
+  // ---------- Ressourcen-Aufräumen ----------
   const stopAnimationLoop = useCallback(() => {
     if (rafRef.current !== null) {
       cancelAnimationFrame(rafRef.current);
@@ -160,6 +202,14 @@ export function VoiceOverlay({
   }, []);
 
   const releaseAnalyser = useCallback(() => {
+    const a = analyserRef.current;
+    if (a) {
+      try {
+        a.disconnect();
+      } catch {
+        // ignore
+      }
+    }
     analyserRef.current = null;
     analyserBufferRef.current = null;
   }, []);
@@ -192,14 +242,9 @@ export function VoiceOverlay({
       }
       currentAudioRevokeRef.current = null;
     }
-    currentAudioUrlRef.current = null;
   }, []);
 
-  const releaseAll = useCallback(() => {
-    stopAnimationLoop();
-    releaseAnalyser();
-    releaseAudioElement();
-    releaseMicStream();
+  const closeAudioContext = useCallback(() => {
     const ctx = audioContextRef.current;
     if (ctx) {
       try {
@@ -209,6 +254,13 @@ export function VoiceOverlay({
       }
       audioContextRef.current = null;
     }
+  }, []);
+
+  const releaseAll = useCallback(() => {
+    stopAnimationLoop();
+    releaseAnalyser();
+    releaseAudioElement();
+    releaseMicStream();
     if (mediaRecorderRef.current) {
       try {
         if (mediaRecorderRef.current.state !== "inactive") {
@@ -221,147 +273,19 @@ export function VoiceOverlay({
     }
     recordedChunksRef.current = [];
     smoothedLevelRef.current = 0;
+    closeAudioContext();
   }, [
     stopAnimationLoop,
     releaseAnalyser,
     releaseAudioElement,
     releaseMicStream,
+    closeAudioContext,
   ]);
 
-  // ---------- Canvas-Animationsschleife ----------
-  const drawFrame = useCallback(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) {
-      rafRef.current = requestAnimationFrame(drawFrame);
-      return;
-    }
-    const ctx = canvas.getContext("2d");
-    if (!ctx) {
-      rafRef.current = requestAnimationFrame(drawFrame);
-      return;
-    }
-
-    const dpr = window.devicePixelRatio || 1;
-    const cssSize = 320;
-    if (canvas.width !== cssSize * dpr || canvas.height !== cssSize * dpr) {
-      canvas.width = cssSize * dpr;
-      canvas.height = cssSize * dpr;
-      canvas.style.width = `${cssSize}px`;
-      canvas.style.height = `${cssSize}px`;
-    }
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, cssSize, cssSize);
-
-    // Live-Pegel aus Analyser lesen.
-    let rawLevel = 0;
-    const analyser = analyserRef.current;
-    const buffer = analyserBufferRef.current;
-    if (analyser && buffer) {
-      // getByteFrequencyData verlangt in aktuellen lib.dom-Typen ein
-      // Uint8Array<ArrayBuffer>. Unser Buffer ist inhaltlich identisch,
-      // aber TypeScript sieht Uint8Array<ArrayBufferLike> – daher hier
-      // explizit casten.
-      analyser.getByteFrequencyData(
-        buffer as unknown as Uint8Array<ArrayBuffer>,
-      );
-      let sum = 0;
-      for (let i = 0; i < buffer.length; i++) sum += buffer[i];
-      rawLevel = sum / buffer.length / 255; // 0..1
-    }
-
-    // Idle-Breathing, wenn kein aktiver Pegel-Quelltyp läuft.
-    const currentStatus = statusRef.current;
-    const useRealLevel =
-      currentStatus === "recording" || currentStatus === "speaking";
-    if (!useRealLevel) {
-      const t = performance.now() / 1000;
-      rawLevel = 0.05 + Math.sin(t * 1.5) * 0.02 + Math.sin(t * 0.7) * 0.02;
-      rawLevel = Math.max(0, rawLevel);
-    }
-
-    // Zeitliches Glätten für weiche Kreisbewegungen.
-    const smoothing = useRealLevel ? 0.4 : 0.08;
-    const prev = smoothedLevelRef.current;
-    const level = prev + (rawLevel - prev) * smoothing;
-    smoothedLevelRef.current = level;
-
-    const cx = cssSize / 2;
-    const cy = cssSize / 2;
-    const baseRadius = 70;
-    const maxExtra = 55;
-    const radius = baseRadius + level * maxExtra;
-
-    // Weiches Hintergrund-Glühen.
-    const glow = ctx.createRadialGradient(cx, cy, radius * 0.2, cx, cy, radius * 2);
-    glow.addColorStop(0, "rgba(201, 162, 39, 0.35)");
-    glow.addColorStop(0.6, "rgba(201, 162, 39, 0.10)");
-    glow.addColorStop(1, "rgba(201, 162, 39, 0)");
-    ctx.fillStyle = glow;
-    ctx.beginPath();
-    ctx.arc(cx, cy, radius * 2, 0, Math.PI * 2);
-    ctx.fill();
-
-    // Zwei umlaufende Ringe – der äußere pulsiert, der innere ist
-    // dichter/stabiler. Wellenlinie erzeugt einen leicht organischen
-    // Look, ohne die Marvel-Ästhetik zu kopieren.
-    const now = performance.now() / 1000;
-    const ringSegments = 96;
-
-    ctx.lineWidth = 2;
-    ctx.strokeStyle = ACCENT_BRIGHT;
-    ctx.beginPath();
-    for (let i = 0; i <= ringSegments; i++) {
-      const a = (i / ringSegments) * Math.PI * 2;
-      const wobble =
-        Math.sin(a * 6 + now * 2.5) * 3 * (0.4 + level) +
-        Math.sin(a * 3 - now * 1.7) * 4 * (0.3 + level);
-      const r = radius + 20 + wobble;
-      const x = cx + Math.cos(a) * r;
-      const y = cy + Math.sin(a) * r;
-      if (i === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    }
-    ctx.stroke();
-
-    // Kern-Kreis mit Verlauf.
-    const core = ctx.createRadialGradient(cx, cy, 4, cx, cy, radius);
-    core.addColorStop(0, "rgba(255, 235, 170, 0.95)");
-    core.addColorStop(0.6, "rgba(217, 178, 58, 0.75)");
-    core.addColorStop(1, "rgba(201, 162, 39, 0.15)");
-    ctx.fillStyle = core;
-    ctx.beginPath();
-    ctx.arc(cx, cy, radius, 0, Math.PI * 2);
-    ctx.fill();
-
-    // Fehler-Status: Kern rötlich einfärben.
-    if (currentStatus === "error") {
-      ctx.fillStyle = "rgba(220, 80, 80, 0.20)";
-      ctx.beginPath();
-      ctx.arc(cx, cy, radius, 0, Math.PI * 2);
-      ctx.fill();
-    }
-
-    // Recording-Statusring (roter Punkt oben).
-    if (currentStatus === "recording") {
-      ctx.fillStyle = "rgba(232, 90, 90, 0.95)";
-      ctx.beginPath();
-      ctx.arc(cx, cy - baseRadius - 12, 5, 0, Math.PI * 2);
-      ctx.fill();
-    }
-
-    rafRef.current = requestAnimationFrame(drawFrame);
-  }, []);
-
-  const ensureAnimationLoop = useCallback(() => {
-    if (rafRef.current !== null) return;
-    rafRef.current = requestAnimationFrame(drawFrame);
-  }, [drawFrame]);
-
-  // ---------- Recording ----------
-
+  // ---------- Web Audio Helpers ----------
   const ensureAudioContext = useCallback((): AudioContext => {
     let ctx = audioContextRef.current;
-    if (!ctx) {
+    if (!ctx || ctx.state === "closed") {
       const Ctor: typeof AudioContext | undefined =
         (window as unknown as { AudioContext?: typeof AudioContext })
           .AudioContext ??
@@ -389,53 +313,406 @@ export function VoiceOverlay({
     );
   }, []);
 
+  // Vorwärtsdeklaration: stopRecording wird von drawFrame per Ref
+  // aufgerufen (VAD-Trigger), definiert wird sie unten.
+  const stopRecordingRef = useRef<() => void>(() => {});
+
+  // ---------- Canvas-Animation (HUD) ----------
+  const drawFrame = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) {
+      rafRef.current = requestAnimationFrame(drawFrame);
+      return;
+    }
+    const ctx2d = canvas.getContext("2d");
+    if (!ctx2d) {
+      rafRef.current = requestAnimationFrame(drawFrame);
+      return;
+    }
+
+    const dpr = window.devicePixelRatio || 1;
+    const cssSize = 360;
+    if (canvas.width !== cssSize * dpr || canvas.height !== cssSize * dpr) {
+      canvas.width = cssSize * dpr;
+      canvas.height = cssSize * dpr;
+      canvas.style.width = `${cssSize}px`;
+      canvas.style.height = `${cssSize}px`;
+    }
+    ctx2d.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx2d.clearRect(0, 0, cssSize, cssSize);
+
+    // Live-Level aus Analyser lesen (0..1).
+    let rawLevel = 0;
+    const analyser = analyserRef.current;
+    const buffer = analyserBufferRef.current;
+    if (analyser && buffer) {
+      analyser.getByteFrequencyData(
+        buffer as unknown as Uint8Array<ArrayBuffer>,
+      );
+      let sum = 0;
+      for (let i = 0; i < buffer.length; i++) sum += buffer[i];
+      rawLevel = sum / buffer.length / 255;
+    }
+
+    const currentStatus = statusRef.current;
+    const useRealLevel =
+      currentStatus === "recording" || currentStatus === "speaking";
+    const now = performance.now();
+
+    // Idle-Breathing.
+    if (!useRealLevel) {
+      const t = now / 1000;
+      rawLevel =
+        0.04 + Math.sin(t * 1.3) * 0.02 + Math.sin(t * 0.6) * 0.02;
+      rawLevel = Math.max(0, rawLevel);
+    }
+
+    const smoothing = useRealLevel ? 0.35 : 0.08;
+    const prev = smoothedLevelRef.current;
+    const level = prev + (rawLevel - prev) * smoothing;
+    smoothedLevelRef.current = level;
+
+    // ---------- VAD während Aufnahme ----------
+    if (currentStatus === "recording") {
+      if (rawLevel > VOICE_LEVEL_THRESHOLD) {
+        lastVoiceAtRef.current = now;
+        if (voiceStartedAtRef.current === 0) {
+          voiceStartedAtRef.current = now;
+        }
+      }
+      const started = voiceStartedAtRef.current;
+      const lastVoice = lastVoiceAtRef.current;
+      const elapsedSinceStart = now - recordingStartRef.current;
+      const enoughVoice = started > 0 && now - started >= MIN_VOICE_MS;
+      const silenceMs = lastVoice > 0 ? now - lastVoice : 0;
+
+      if (
+        !autoStopTriggeredRef.current &&
+        ((enoughVoice && silenceMs >= SILENCE_HOLD_MS) ||
+          elapsedSinceStart >= MAX_RECORDING_MS)
+      ) {
+        autoStopTriggeredRef.current = true;
+        try {
+          stopRecordingRef.current();
+        } catch {
+          // ignore
+        }
+      }
+    }
+
+    const cx = cssSize / 2;
+    const cy = cssSize / 2;
+    const baseRadius = 78;
+    const maxExtra = 42;
+    const radius = baseRadius + level * maxExtra;
+
+    // ---------- Layer 1: weiches Zentral-Glow ----------
+    const glow = ctx2d.createRadialGradient(
+      cx,
+      cy,
+      radius * 0.15,
+      cx,
+      cy,
+      radius * 2.6,
+    );
+    if (currentStatus === "error") {
+      glow.addColorStop(0, "rgba(220, 80, 80, 0.35)");
+      glow.addColorStop(0.5, "rgba(220, 80, 80, 0.08)");
+      glow.addColorStop(1, "rgba(220, 80, 80, 0)");
+    } else {
+      glow.addColorStop(0, "rgba(232, 193, 74, 0.30)");
+      glow.addColorStop(0.5, "rgba(201, 162, 39, 0.08)");
+      glow.addColorStop(1, "rgba(201, 162, 39, 0)");
+    }
+    ctx2d.fillStyle = glow;
+    ctx2d.beginPath();
+    ctx2d.arc(cx, cy, radius * 2.6, 0, Math.PI * 2);
+    ctx2d.fill();
+
+    // ---------- Layer 2: äußerer HUD-Ring mit rotierenden Ticks ----------
+    const outerR = 160;
+    const tickCount = 72;
+    const rot = (now / 6000) * Math.PI * 2; // langsam
+    ctx2d.save();
+    ctx2d.translate(cx, cy);
+    ctx2d.rotate(rot);
+    for (let i = 0; i < tickCount; i++) {
+      const a = (i / tickCount) * Math.PI * 2;
+      const long = i % 6 === 0;
+      const len = long ? 12 : 5;
+      const alpha = long ? 0.65 : 0.28;
+      ctx2d.strokeStyle = `rgba(232, 193, 74, ${alpha})`;
+      ctx2d.lineWidth = long ? 1.4 : 0.8;
+      const x1 = Math.cos(a) * (outerR - len);
+      const y1 = Math.sin(a) * (outerR - len);
+      const x2 = Math.cos(a) * outerR;
+      const y2 = Math.sin(a) * outerR;
+      ctx2d.beginPath();
+      ctx2d.moveTo(x1, y1);
+      ctx2d.lineTo(x2, y2);
+      ctx2d.stroke();
+    }
+    ctx2d.restore();
+
+    // Feiner Ring als Kontur zum äußeren HUD.
+    ctx2d.strokeStyle = "rgba(232, 193, 74, 0.18)";
+    ctx2d.lineWidth = 0.7;
+    ctx2d.beginPath();
+    ctx2d.arc(cx, cy, outerR + 2, 0, Math.PI * 2);
+    ctx2d.stroke();
+
+    // Sekundär-Ring, gegenrotierend (dünn, sehr subtil).
+    const rot2 = -(now / 9000) * Math.PI * 2;
+    ctx2d.save();
+    ctx2d.translate(cx, cy);
+    ctx2d.rotate(rot2);
+    const secR = 138;
+    ctx2d.strokeStyle = "rgba(232, 193, 74, 0.10)";
+    ctx2d.lineWidth = 0.6;
+    ctx2d.setLineDash([4, 8]);
+    ctx2d.beginPath();
+    ctx2d.arc(0, 0, secR, 0, Math.PI * 2);
+    ctx2d.stroke();
+    ctx2d.setLineDash([]);
+    ctx2d.restore();
+
+    // ---------- Layer 3: mittlerer Wellen-Ring ----------
+    const ringSegments = 128;
+    const waveT = now / 1000;
+    ctx2d.lineWidth = 1.8;
+    ctx2d.strokeStyle = ACCENT_BRIGHT;
+    ctx2d.shadowBlur = 8;
+    ctx2d.shadowColor = ACCENT_SOFT;
+    ctx2d.beginPath();
+    for (let i = 0; i <= ringSegments; i++) {
+      const a = (i / ringSegments) * Math.PI * 2;
+      const wobble =
+        Math.sin(a * 6 + waveT * 2.5) * 3 * (0.35 + level) +
+        Math.sin(a * 3 - waveT * 1.7) * 4 * (0.3 + level) +
+        Math.sin(a * 11 + waveT * 3.2) * 1.6 * (0.2 + level);
+      const r = radius + 18 + wobble;
+      const x = cx + Math.cos(a) * r;
+      const y = cy + Math.sin(a) * r;
+      if (i === 0) ctx2d.moveTo(x, y);
+      else ctx2d.lineTo(x, y);
+    }
+    ctx2d.stroke();
+    ctx2d.shadowBlur = 0;
+
+    // ---------- Layer 4: Partikel ----------
+    const particles = particlesRef.current;
+    const drift = useRealLevel ? 0.6 + level * 3.5 : 0.15;
+    for (const p of particles) {
+      p.radius += p.speed * drift;
+      p.angle += 0.002;
+      if (p.radius > outerR - 10) {
+        p.radius = baseRadius + Math.random() * 20;
+        p.angle = Math.random() * Math.PI * 2;
+        p.alpha = 0.2 + Math.random() * 0.5;
+      }
+      const px = cx + Math.cos(p.angle) * p.radius;
+      const py = cy + Math.sin(p.angle) * p.radius;
+      const fade = 1 - (p.radius - baseRadius) / (outerR - baseRadius);
+      ctx2d.fillStyle = `rgba(232, 193, 74, ${(p.alpha * fade).toFixed(3)})`;
+      ctx2d.beginPath();
+      ctx2d.arc(px, py, p.size, 0, Math.PI * 2);
+      ctx2d.fill();
+    }
+
+    // ---------- Layer 5: Kern mit Glow/Bloom ----------
+    const core = ctx2d.createRadialGradient(cx, cy, 2, cx, cy, radius);
+    core.addColorStop(0, "rgba(255, 236, 175, 0.95)");
+    core.addColorStop(0.55, "rgba(217, 178, 58, 0.55)");
+    core.addColorStop(1, "rgba(201, 162, 39, 0.06)");
+    ctx2d.fillStyle = core;
+    ctx2d.shadowBlur = 24;
+    ctx2d.shadowColor = ACCENT;
+    ctx2d.beginPath();
+    ctx2d.arc(cx, cy, radius, 0, Math.PI * 2);
+    ctx2d.fill();
+    ctx2d.shadowBlur = 0;
+
+    if (currentStatus === "error") {
+      ctx2d.fillStyle = "rgba(220, 80, 80, 0.22)";
+      ctx2d.beginPath();
+      ctx2d.arc(cx, cy, radius, 0, Math.PI * 2);
+      ctx2d.fill();
+    }
+
+    // Recording-Marker: kleiner roter Punkt oben, zurückhaltend.
+    if (currentStatus === "recording") {
+      const pulse = 0.55 + Math.sin(now / 220) * 0.35;
+      ctx2d.fillStyle = `rgba(232, 90, 90, ${pulse.toFixed(3)})`;
+      ctx2d.beginPath();
+      ctx2d.arc(cx, cy - outerR - 14, 3.5, 0, Math.PI * 2);
+      ctx2d.fill();
+    }
+
+    rafRef.current = requestAnimationFrame(drawFrame);
+  }, []);
+
+  const ensureAnimationLoop = useCallback(() => {
+    if (rafRef.current !== null) return;
+    rafRef.current = requestAnimationFrame(drawFrame);
+  }, [drawFrame]);
+
+  // ---------- Recording ----------
   const startRecording = useCallback(async () => {
     setError(null);
+
+    // Immer sicherstellen, dass ein evtl. hängengebliebener alter Stream,
+    // Analyser oder Recorder gestoppt ist, BEVOR wir einen neuen Zugriff
+    // beantragen. Sonst kann iOS Safari einen frischen getUserMedia-Call
+    // ablehnen (kein wirklich "denied"-Permission-Fehler, aber wir sind
+    // auf der sicheren Seite).
+    releaseAnalyser();
+    releaseMicStream();
+    if (mediaRecorderRef.current) {
+      try {
+        if (mediaRecorderRef.current.state !== "inactive") {
+          mediaRecorderRef.current.stop();
+        }
+      } catch {
+        // ignore
+      }
+      mediaRecorderRef.current = null;
+    }
+    recordedChunksRef.current = [];
+    smoothedLevelRef.current = 0;
+    voiceStartedAtRef.current = 0;
+    lastVoiceAtRef.current = 0;
+    autoStopTriggeredRef.current = false;
+
+    let stream: MediaStream;
     try {
-      const ctx = ensureAudioContext();
-      const stream = await navigator.mediaDevices.getUserMedia({
+      // getUserMedia zuerst — der User-Gesture (Click) muss so nah wie
+      // möglich am Aufruf sein, bevor irgendetwas Anderes awaitet.
+      stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true,
         },
       });
-      mediaStreamRef.current = stream;
+    } catch (err) {
+      const e = err as { name?: string; message?: string };
+      console.error("[voice] getUserMedia rejected:", e?.name, e?.message, err);
+      setError(userFriendlyError(err));
+      setStatus("error");
+      return;
+    }
+    mediaStreamRef.current = stream;
 
+    let recorder: MediaRecorder;
+    try {
+      const ctx = ensureAudioContext();
       const source = ctx.createMediaStreamSource(stream);
       attachAnalyser(source);
 
       const mimeType = pickMimeType();
       recordingMimeRef.current = mimeType;
-      const recorder = mimeType
+      recorder = mimeType
         ? new MediaRecorder(stream, { mimeType })
         : new MediaRecorder(stream);
-
-      recordedChunksRef.current = [];
-      recordingStartRef.current = performance.now();
-
-      recorder.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) {
-          recordedChunksRef.current.push(e.data);
-        }
-      };
-      recorder.onerror = (e) => {
-        console.error("[voice] MediaRecorder error", e);
-        setError("Aufnahme fehlgeschlagen.");
-        setStatus("error");
-      };
-
-      mediaRecorderRef.current = recorder;
-      recorder.start(250);
-      setStatus("recording");
     } catch (err) {
-      console.error("[voice] Aufnahme konnte nicht gestartet werden", err);
+      const e = err as { name?: string; message?: string };
+      console.error("[voice] recorder setup failed:", e?.name, e?.message, err);
       setError(userFriendlyError(err));
       setStatus("error");
-      releaseMicStream();
       releaseAnalyser();
+      releaseMicStream();
+      return;
     }
+
+    recordingStartRef.current = performance.now();
+    recorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) {
+        recordedChunksRef.current.push(e.data);
+      }
+    };
+    recorder.onerror = (e) => {
+      console.error("[voice] MediaRecorder error", e);
+      setError("Aufnahme fehlgeschlagen.");
+      setStatus("error");
+    };
+
+    mediaRecorderRef.current = recorder;
+    try {
+      recorder.start(250);
+    } catch (err) {
+      const e = err as { name?: string; message?: string };
+      console.error("[voice] recorder.start failed:", e?.name, e?.message, err);
+      setError(userFriendlyError(err));
+      setStatus("error");
+      releaseAnalyser();
+      releaseMicStream();
+      return;
+    }
+    setStatus("recording");
   }, [attachAnalyser, ensureAudioContext, releaseAnalyser, releaseMicStream]);
+
+  // ---------- TTS Playback (declared before runVoiceTurn) ----------
+  const playTts = useCallback(
+    async (text: string): Promise<void> => {
+      const speak = await speakText(text);
+      if (cancelledRef.current) {
+        speak.revoke();
+        return;
+      }
+      if (speak.usage.length > 0) {
+        void logUsage(userId, speak.usage as UsageEntry[]);
+      }
+
+      releaseAudioElement();
+
+      const ctx = ensureAudioContext();
+      const audio = new Audio();
+      audio.crossOrigin = "anonymous";
+      audio.src = speak.audioUrl;
+      audioElementRef.current = audio;
+      currentAudioRevokeRef.current = speak.revoke;
+
+      try {
+        const source = ctx.createMediaElementSource(audio);
+        source.connect(ctx.destination);
+        attachAnalyser(source);
+        audioSourceNodeRef.current = source;
+      } catch (err) {
+        console.warn("[voice] createMediaElementSource failed", err);
+      }
+
+      await new Promise<void>((resolve, reject) => {
+        const cleanup = () => {
+          audio.removeEventListener("ended", onEnded);
+          audio.removeEventListener("error", onError);
+        };
+        const onEnded = () => {
+          cleanup();
+          resolve();
+        };
+        const onError = () => {
+          cleanup();
+          reject(new Error("Audio konnte nicht abgespielt werden."));
+        };
+        audio.addEventListener("ended", onEnded);
+        audio.addEventListener("error", onError);
+        audio.play().catch((err) => {
+          cleanup();
+          reject(err);
+        });
+      });
+
+      releaseAudioElement();
+      releaseAnalyser();
+    },
+    [
+      attachAnalyser,
+      ensureAudioContext,
+      releaseAnalyser,
+      releaseAudioElement,
+      userId,
+    ],
+  );
 
   const runVoiceTurn = useCallback(
     async (audioBlob: Blob, durationMs: number) => {
@@ -496,10 +773,7 @@ export function VoiceOverlay({
       if (cancelledRef.current) return;
       setStatus("idle");
     },
-    // playTts is stable via ref-based closure; we ignore lint here to
-    // keep the callback identity stable across renders.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [onTurn, userId],
+    [onTurn, userId, playTts],
   );
 
   const stopRecording = useCallback(async () => {
@@ -510,7 +784,6 @@ export function VoiceOverlay({
     const durationMs = performance.now() - startedAt;
     const mimeType = recordingMimeRef.current;
 
-    // Warten, bis der letzte "dataavailable"-Chunk eingetrudelt ist.
     const stopped = new Promise<void>((resolve) => {
       const onStop = () => {
         recorder.removeEventListener("stop", onStop);
@@ -520,10 +793,19 @@ export function VoiceOverlay({
     });
     try {
       if (recorder.state !== "inactive") recorder.stop();
+      else resolveStopped();
     } catch {
-      // ignore
+      resolveStopped();
     }
-    await stopped;
+    function resolveStopped() {
+      // no-op: stopped-Promise wird per Event aufgelöst; wenn Recorder
+      // schon inaktiv war, gibt es keinen stop-Event mehr → wir warten
+      // hier bewusst nur kurz, indem wir das Promise nicht mehr blockieren.
+    }
+    await Promise.race([
+      stopped,
+      new Promise<void>((r) => setTimeout(r, 800)),
+    ]);
 
     releaseAnalyser();
     releaseMicStream();
@@ -547,84 +829,24 @@ export function VoiceOverlay({
     void runVoiceTurn(blob, durationMs);
   }, [releaseAnalyser, releaseMicStream, runVoiceTurn]);
 
-  // ---------- TTS-Wiedergabe ----------
-  const playTts = useCallback(
-    async (text: string): Promise<void> => {
-      const speak = await speakText(text);
-      if (cancelledRef.current) {
-        speak.revoke();
-        return;
-      }
-      if (speak.usage.length > 0) {
-        void logUsage(userId, speak.usage as UsageEntry[]);
-      }
-
-      // Vorheriges Audio aufräumen.
-      releaseAudioElement();
-
-      const ctx = ensureAudioContext();
-      const audio = new Audio();
-      audio.crossOrigin = "anonymous";
-      audio.src = speak.audioUrl;
-      audioElementRef.current = audio;
-      currentAudioUrlRef.current = speak.audioUrl;
-      currentAudioRevokeRef.current = speak.revoke;
-
-      try {
-        const source = ctx.createMediaElementSource(audio);
-        source.connect(ctx.destination);
-        attachAnalyser(source);
-        audioSourceNodeRef.current = source;
-      } catch (err) {
-        // Manche Browser erlauben nur einen MediaElementSource pro
-        // Element; im Fehlerfall spielen wir das Audio wenigstens ohne
-        // Analyser ab.
-        console.warn("[voice] createMediaElementSource failed", err);
-      }
-
-      await new Promise<void>((resolve, reject) => {
-        const onEnded = () => {
-          cleanup();
-          resolve();
-        };
-        const onError = () => {
-          cleanup();
-          reject(new Error("Audio konnte nicht abgespielt werden."));
-        };
-        const cleanup = () => {
-          audio.removeEventListener("ended", onEnded);
-          audio.removeEventListener("error", onError);
-        };
-        audio.addEventListener("ended", onEnded);
-        audio.addEventListener("error", onError);
-        audio.play().catch((err) => {
-          cleanup();
-          reject(err);
-        });
-      });
-
-      // Nach dem Ende Analyser lösen, damit der Kreis wieder ins Idle
-      // fällt statt weiter zu spitzen.
-      releaseAudioElement();
-      releaseAnalyser();
-    },
-    [
-      attachAnalyser,
-      ensureAudioContext,
-      releaseAnalyser,
-      releaseAudioElement,
-      userId,
-    ],
-  );
+  // stopRecordingRef aktuell halten, damit VAD-Trigger im drawFrame
+  // immer die frische Callback aufruft.
+  useEffect(() => {
+    stopRecordingRef.current = () => {
+      void stopRecording();
+    };
+  }, [stopRecording]);
 
   // ---------- Tap-Handler ----------
-  const handleMainTap = useCallback(async () => {
+  const handleMainTap = useCallback(() => {
     if (status === "idle") {
-      await startRecording();
+      void startRecording();
       return;
     }
     if (status === "recording") {
-      await stopRecording();
+      // Manueller Notfall-Stopp: als hätte VAD gegriffen.
+      autoStopTriggeredRef.current = true;
+      void stopRecording();
       return;
     }
     if (status === "error") {
@@ -632,8 +854,6 @@ export function VoiceOverlay({
       setStatus("idle");
       return;
     }
-    // In transcribing/thinking/speaking bewusst kein Tap – der Nutzer
-    // wartet die aktuelle Antwort ab.
   }, [status, startRecording, stopRecording]);
 
   // ---------- Lifecycle ----------
@@ -644,7 +864,6 @@ export function VoiceOverlay({
     setStatus("idle");
     setError(null);
 
-    // Body-Scroll unterbinden, solange das Overlay offen ist.
     const prevOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
 
@@ -655,7 +874,6 @@ export function VoiceOverlay({
     };
   }, [open, ensureAnimationLoop, releaseAll]);
 
-  // ESC schließt das Overlay.
   useEffect(() => {
     if (!open) return;
     const handler = (e: KeyboardEvent) => {
@@ -671,75 +889,99 @@ export function VoiceOverlay({
   const canTap =
     status === "idle" || status === "recording" || status === "error";
 
+  const hint =
+    status === "idle"
+      ? "Antippen und sprechen — ich sende automatisch, wenn du pausierst."
+      : status === "recording"
+        ? "Sprich weiter. Antippen stoppt sofort."
+        : status === "error"
+          ? "Antippen für neuen Versuch, oder Sprachmodus schließen."
+          : "";
+
   return (
     <div
       role="dialog"
       aria-modal="true"
       aria-label="MyBro Sprachmodus"
-      className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-bg/95 backdrop-blur-md"
+      className="fixed inset-0 z-50 flex flex-col items-center justify-center"
+      style={{
+        background:
+          "radial-gradient(ellipse at center, #0d0d12 0%, #050507 55%, #000000 100%)",
+      }}
     >
+      {/* Vignette-Schicht */}
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-0"
+        style={{
+          background:
+            "radial-gradient(ellipse at center, transparent 40%, rgba(0,0,0,0.55) 90%)",
+        }}
+      />
+      {/* Feine Scanline / Grid-Andeutung */}
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-0 opacity-[0.06]"
+        style={{
+          backgroundImage:
+            "repeating-linear-gradient(0deg, rgba(232,193,74,0.6) 0px, rgba(232,193,74,0.6) 1px, transparent 1px, transparent 3px)",
+        }}
+      />
+
       <button
         type="button"
         onClick={onClose}
         aria-label="Sprachmodus schließen"
-        className="absolute right-4 top-4 inline-flex h-11 w-11 items-center justify-center rounded-full border border-border bg-bg-elevated text-text-muted transition-colors hover:text-text"
+        className="absolute right-4 top-4 z-10 inline-flex h-11 w-11 items-center justify-center rounded-full border border-accent/25 bg-black/40 text-accent/70 backdrop-blur-sm transition-colors hover:text-accent"
       >
         <CloseIcon className="h-5 w-5" />
       </button>
 
-      <div className="flex flex-col items-center gap-8 px-6 text-center">
+      <div className="relative flex flex-col items-center gap-8 px-6 text-center">
+        {/* Der ganze Kreis ist der Tap-Bereich. Kein Vollton-Button mehr. */}
         <button
           type="button"
-          onClick={() => {
-            void handleMainTap();
-          }}
+          onClick={handleMainTap}
           disabled={!canTap}
           aria-label={
             status === "recording"
-              ? "Aufnahme stoppen und senden"
+              ? "Aufnahme sofort stoppen"
               : status === "idle"
-                ? "Aufnahme starten"
+                ? "Sprachaufnahme starten"
                 : "Sprachmodus"
           }
-          className="group relative inline-flex h-[320px] w-[320px] items-center justify-center rounded-full outline-none focus-visible:ring-4 focus-visible:ring-accent/40 disabled:cursor-default"
+          className="group relative inline-flex h-[360px] w-[360px] items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-accent/40 disabled:cursor-default"
+          style={{ background: "transparent" }}
         >
           <canvas
             ref={canvasRef}
             className="pointer-events-none absolute inset-0"
             aria-hidden="true"
           />
-          <span className="pointer-events-none relative inline-flex h-16 w-16 items-center justify-center rounded-full border border-accent/60 bg-bg/40 text-accent shadow-lg backdrop-blur-sm">
-            <MicIcon className="h-7 w-7" />
-          </span>
         </button>
 
         <div className="min-h-[3rem] max-w-md">
           <p
             className={
               error
-                ? "text-base text-red-300"
-                : "text-base text-text-muted"
+                ? "font-mono text-sm uppercase tracking-[0.28em] text-red-300/90"
+                : "font-mono text-sm uppercase tracking-[0.28em] text-accent/80"
             }
             role={error ? "alert" : "status"}
             aria-live="polite"
           >
             {statusText}
           </p>
-          {status === "recording" ? (
-            <p className="mt-2 text-xs text-text-muted">
-              Nochmal antippen, um deine Aufnahme zu senden.
-            </p>
-          ) : null}
-          {status === "error" ? (
-            <p className="mt-2 text-xs text-text-muted">
-              Tippe den Kreis an, um erneut zu versuchen, oder schließe den Sprachmodus.
+          {hint ? (
+            <p className="mt-3 font-mono text-[10px] uppercase tracking-[0.32em] text-text-muted/60">
+              {hint}
             </p>
           ) : null}
         </div>
       </div>
 
-      <p className="absolute bottom-6 left-0 right-0 text-center text-xs text-text-muted/70">
-        Deine Worte landen als normale Nachricht im Chatverlauf.
+      <p className="absolute bottom-6 left-0 right-0 text-center font-mono text-[10px] uppercase tracking-[0.32em] text-text-muted/40">
+        Deine Worte landen als Nachricht im Chatverlauf
       </p>
     </div>
   );
