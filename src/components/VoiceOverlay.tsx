@@ -703,23 +703,49 @@ export function VoiceOverlay({
         );
       }
 
-      if (audioBuffer) {
+      if (audioBuffer && audioBuffer.duration > 0.05) {
+        console.info(
+          "[voice] TTS play via WebAudio: duration=",
+          audioBuffer.duration.toFixed(2),
+          "s, ctx.state=",
+          ctx.state,
+          "sampleRate=",
+          ctx.sampleRate,
+        );
         const source = ctx.createBufferSource();
         source.buffer = audioBuffer;
+
+        // Master-Gain am Ausgang, damit der Ton garantiert läuft, auch
+        // wenn irgendein Splitter/Analyser-Zweig etwas verschluckt.
+        const gain = ctx.createGain();
+        gain.gain.value = 1.0;
+        source.connect(gain);
+        gain.connect(ctx.destination);
+
+        // Analyser als reines Tap, NICHT an destination hängen — sonst
+        // bekäme das Signal zwei Wege und würde bei manchen Browsern
+        // ausgemischt / stumm.
         const analyser = ctx.createAnalyser();
         analyser.fftSize = 512;
         analyser.smoothingTimeConstant = 0.6;
         source.connect(analyser);
-        analyser.connect(ctx.destination);
         analyserRef.current = analyser;
         analyserBufferRef.current = new Uint8Array(
           new ArrayBuffer(analyser.frequencyBinCount),
         );
 
+        const startedAt = performance.now();
         await new Promise<void>((resolve, reject) => {
           source.onended = () => {
+            const elapsed = performance.now() - startedAt;
+            console.info(
+              "[voice] TTS source.onended after",
+              elapsed.toFixed(0),
+              "ms",
+            );
             try {
               source.disconnect();
+              gain.disconnect();
             } catch {
               // ignore
             }
@@ -735,6 +761,14 @@ export function VoiceOverlay({
         releaseAnalyser();
         releaseAudioElement();
         return;
+      }
+
+      if (audioBuffer) {
+        console.warn(
+          "[voice] decoded buffer duration too short:",
+          audioBuffer.duration,
+          "- falling back to <audio>",
+        );
       }
 
       // Fallback: HTMLAudioElement. Kann NotAllowedError werfen — wird
