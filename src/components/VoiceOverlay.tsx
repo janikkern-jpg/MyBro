@@ -78,19 +78,30 @@ function pickMimeType(): string {
   return "";
 }
 
-function userFriendlyError(err: unknown): string {
+function userFriendlyError(err: unknown, context: "mic" | "playback" | "generic" = "generic"): string {
   if (!err) return "Unbekannter Fehler.";
   const anyErr = err as {
     name?: string;
     message?: string;
     status?: number;
   };
-  // Bewusst NUR echter Permission-Fehler mappt auf "verweigert" — kein
-  // SecurityError, kein InvalidStateError, weil diese in der Praxis
-  // andere Ursachen haben (AudioContext-Race, doppelter Node-Graph)
-  // und der Nutzer sonst denkt, er hätte die Erlaubnis versaut.
-  if (anyErr?.name === "NotAllowedError" || anyErr?.name === "PermissionDeniedError") {
+  // NotAllowedError bedeutet je nach Kontext etwas komplett anderes:
+  // - bei getUserMedia: Mikrofon verweigert
+  // - bei audio.play(): Browser-Autoplay-Policy hat play() blockiert
+  // Nur den Mikro-Kontext auf die Berechtigungsmeldung mappen.
+  if (
+    context === "mic" &&
+    (anyErr?.name === "NotAllowedError" ||
+      anyErr?.name === "PermissionDeniedError")
+  ) {
     return "Mikrofonzugriff wurde verweigert. Bitte in den Browser-Einstellungen erlauben und erneut versuchen.";
+  }
+  if (
+    context === "playback" &&
+    (anyErr?.name === "NotAllowedError" ||
+      anyErr?.name === "AbortError")
+  ) {
+    return "Sprachausgabe wurde vom Browser blockiert. Bitte den Sprachmodus erneut antippen.";
   }
   if (anyErr?.name === "NotFoundError" || anyErr?.name === "OverconstrainedError") {
     return "Kein passendes Mikrofon gefunden.";
@@ -597,7 +608,7 @@ export function VoiceOverlay({
     } catch (err) {
       const e = err as { name?: string; message?: string };
       console.error("[voice] getUserMedia rejected:", e?.name, e?.message, err);
-      setError(userFriendlyError(err));
+      setError(userFriendlyError(err, "mic"));
       setStatus("error");
       return;
     }
@@ -617,7 +628,7 @@ export function VoiceOverlay({
     } catch (err) {
       const e = err as { name?: string; message?: string };
       console.error("[voice] recorder setup failed:", e?.name, e?.message, err);
-      setError(userFriendlyError(err));
+      setError(userFriendlyError(err, "generic"));
       setStatus("error");
       releaseAnalyser();
       releaseMicStream();
@@ -642,7 +653,7 @@ export function VoiceOverlay({
     } catch (err) {
       const e = err as { name?: string; message?: string };
       console.error("[voice] recorder.start failed:", e?.name, e?.message, err);
-      setError(userFriendlyError(err));
+      setError(userFriendlyError(err, "generic"));
       setStatus("error");
       releaseAnalyser();
       releaseMicStream();
@@ -664,13 +675,73 @@ export function VoiceOverlay({
       }
 
       releaseAudioElement();
+      currentAudioRevokeRef.current = speak.revoke;
 
       const ctx = ensureAudioContext();
+      if (ctx.state === "suspended") {
+        try {
+          await ctx.resume();
+        } catch {
+          // ignore
+        }
+      }
+
+      // Web-Audio-API-Pfad: decodeAudioData + AudioBufferSourceNode.
+      // Umgeht die HTMLMediaElement-Autoplay-Policy, die im Anschluss
+      // an einen Klick + getUserMedia trotzdem noch NotAllowedError
+      // werfen kann, wenn zwischen Klick und play() zu viel Zeit lag.
+      let audioBuffer: AudioBuffer | null = null;
+      try {
+        audioBuffer = await ctx.decodeAudioData(speak.arrayBuffer.slice(0));
+      } catch (err) {
+        const e = err as { name?: string; message?: string };
+        console.warn(
+          "[voice] decodeAudioData failed, falling back to <audio>:",
+          e?.name,
+          e?.message,
+          err,
+        );
+      }
+
+      if (audioBuffer) {
+        const source = ctx.createBufferSource();
+        source.buffer = audioBuffer;
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 512;
+        analyser.smoothingTimeConstant = 0.6;
+        source.connect(analyser);
+        analyser.connect(ctx.destination);
+        analyserRef.current = analyser;
+        analyserBufferRef.current = new Uint8Array(
+          new ArrayBuffer(analyser.frequencyBinCount),
+        );
+
+        await new Promise<void>((resolve, reject) => {
+          source.onended = () => {
+            try {
+              source.disconnect();
+            } catch {
+              // ignore
+            }
+            resolve();
+          };
+          try {
+            source.start(0);
+          } catch (err) {
+            reject(err);
+          }
+        });
+
+        releaseAnalyser();
+        releaseAudioElement();
+        return;
+      }
+
+      // Fallback: HTMLAudioElement. Kann NotAllowedError werfen — wird
+      // vom Aufrufer als "playback"-Kontext erkannt.
       const audio = new Audio();
-      audio.crossOrigin = "anonymous";
       audio.src = speak.audioUrl;
       audioElementRef.current = audio;
-      currentAudioRevokeRef.current = speak.revoke;
 
       try {
         const source = ctx.createMediaElementSource(audio);
@@ -728,7 +799,7 @@ export function VoiceOverlay({
       } catch (err) {
         console.error("[voice] Transkription fehlgeschlagen", err);
         if (cancelledRef.current) return;
-        setError(userFriendlyError(err));
+        setError(userFriendlyError(err, "generic"));
         setStatus("error");
         return;
       }
@@ -747,7 +818,7 @@ export function VoiceOverlay({
       } catch (err) {
         console.error("[voice] LLM-Turn fehlgeschlagen", err);
         if (cancelledRef.current) return;
-        setError(userFriendlyError(err));
+        setError(userFriendlyError(err, "generic"));
         setStatus("error");
         return;
       }
@@ -763,9 +834,10 @@ export function VoiceOverlay({
       try {
         await playTts(spokenText);
       } catch (err) {
-        console.error("[voice] TTS fehlgeschlagen", err);
+        const e = err as { name?: string; message?: string };
+        console.error("[voice] TTS fehlgeschlagen:", e?.name, e?.message, err);
         if (cancelledRef.current) return;
-        setError(userFriendlyError(err));
+        setError(userFriendlyError(err, "playback"));
         setStatus("error");
         return;
       }

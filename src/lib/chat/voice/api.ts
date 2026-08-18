@@ -78,6 +78,9 @@ export async function transcribeAudio(
 
 export type SpeakResult = {
   audioUrl: string;
+  // Rohe Audio-Bytes für den Web-Audio-API-Pfad (decodeAudioData +
+  // AudioBufferSourceNode). Umgeht die Autoplay-Policy von <audio>.
+  arrayBuffer: ArrayBuffer;
   mimeType: string;
   usage: UsageEntry[];
   // Halte den ObjectURL, damit der Aufrufer ihn nach dem Abspielen
@@ -130,8 +133,14 @@ export async function speakText(
   const audioUrl = URL.createObjectURL(blob);
   const usage = Array.isArray(obj._usage) ? (obj._usage as UsageEntry[]) : [];
 
+  // arrayBuffer entkoppelt vom Blob halten, damit decodeAudioData einen
+  // eigenen, nicht-detachten Buffer bekommt (Safari detached sonst).
+  const arrayBuffer = new ArrayBuffer(bytes.length);
+  new Uint8Array(arrayBuffer).set(bytes);
+
   return {
     audioUrl,
+    arrayBuffer,
     mimeType,
     usage,
     revoke: () => URL.revokeObjectURL(audioUrl),
