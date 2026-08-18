@@ -9,6 +9,18 @@ import SmalltalkProjectDetailPage from "./pages/SmalltalkProjectDetail";
 import LoginPage from "./pages/Login";
 import { AuthProvider, useAuth } from "./lib/auth";
 import { ModeProvider } from "./lib/mode";
+import { supabaseConfigError } from "./lib/supabase";
+
+function ConfigError({ message }: { message: string }) {
+  return (
+    <div className="min-h-dvh bg-bg text-text flex items-center justify-center p-6">
+      <div className="max-w-md rounded-lg border border-red-500/30 bg-red-500/10 p-4 text-sm text-red-200">
+        <p className="mb-2 font-semibold">Konfigurationsfehler</p>
+        <p className="whitespace-pre-line">{message}</p>
+      </div>
+    </div>
+  );
+}
 
 function AuthGate() {
   const { user, loading } = useAuth();
@@ -47,6 +59,9 @@ function AuthGate() {
 }
 
 export default function App() {
+  if (supabaseConfigError) {
+    return <ConfigError message={supabaseConfigError} />;
+  }
   return (
     <AuthProvider>
       <BrowserRouter>
