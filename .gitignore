@@ -16,6 +16,11 @@ dist-ssr
 .env
 .env.*
 !.env.example
+# .env.production wird committet: enthält nur Vite-Client-Werte
+# (Supabase-URL + publishable Anon-Key), die ohnehin im JS-Bundle
+# sichtbar sind. So läuft der Cloudflare-CI-Build ohne Dashboard-
+# Konfiguration.
+!.env.production
 
 # Netlify
 .netlify
